@@ -44,6 +44,7 @@ QtObject {
             check(write.method === "settings.set" && write.params.key === "enablePersistingInGameSettings"
                 && write.params.value === enabled, "desktop requests the persisted preference")
             client.eventReceived("settings.changed", {key:"enablePersistingInGameSettings", value:enabled})
+            client.responseReceived(write.id, {key:"enablePersistingInGameSettings", value:enabled})
             check(toggle.checked === enabled && ShellStore.settings.enablePersistingInGameSettings === enabled,
                 "desktop reflects the saved value")
             check(consolePage.settingsModel().find(item => item.key === "enablePersistingInGameSettings").v
@@ -54,6 +55,7 @@ QtObject {
         check(write.method === "settings.set" && write.params.key === "enablePersistingInGameSettings"
             && write.params.value === true, "console writes the same preference")
         client.eventReceived("settings.changed", {key:"enablePersistingInGameSettings", value:true})
+        client.responseReceived(write.id, {key:"enablePersistingInGameSettings", value:true})
         check(toggle.checked, "desktop reflects console changes")
         consolePage.destroy()
 
@@ -63,19 +65,21 @@ QtObject {
             for (const selectedIndex of [0, 1]) {
                 for (const directConsoleMode of [false, true]) {
                     ShellStore.selectedGame = {
-                        title:"Fixture", launchAppId:"12345", selectedVariantIndex:selectedIndex,
+                        id:"fixture-parent",title:"Fixture", launchAppId:"12345", selectedVariantIndex:selectedIndex,
                         variants:[
-                            {appId:"12345", supportsInGameSettingsPersistence:support},
-                            {appId:"67890", supportsInGameSettingsPersistence:!support}
+                            {id:"12345", libraryStatus:"MANUAL", librarySelected:true, inLibrary:true, supportsInGameSettingsPersistence:support},
+                            {id:"67890", libraryStatus:"MANUAL", librarySelected:true, inLibrary:true, supportsInGameSettingsPersistence:!support}
                         ]
                     }
                     ShellStore.launchSelectedGame(directConsoleMode)
+                    client.responseReceived(ShellStore.launchInspectRequestId, {appId:"fixture-parent",variantId:selectedIndex === 0 ? "12345" : "67890",game:ShellStore.selectedGame,decision:{status:"ready"}})
                     const request = client.calls[client.calls.length - 1]
                     const expectedSupport = selectedIndex === 0 ? support === true : !support
                     check(request.method === "session.remote.list"
                         && request.params.supportsInGameSettingsPersistence === expectedSupport,
                         "launch uses the selected storefront's support flag")
                     client.responseReceived(request.id, {sessions:[]})
+                    client.responseReceived(ShellStore.launchInspectRequestId, {appId:"fixture-parent",variantId:selectedIndex === 0 ? "12345" : "67890",game:ShellStore.selectedGame,decision:{status:"ready"}})
                     const create = client.calls[client.calls.length - 1]
                     check(create.method === "session.create"
                         && create.params.supportsInGameSettingsPersistence === expectedSupport,

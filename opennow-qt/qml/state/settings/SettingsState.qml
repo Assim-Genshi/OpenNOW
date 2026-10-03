@@ -7,6 +7,7 @@ QtObject {
     required property var i18n
     required property bool ready
     required property var subscription
+    required property var authSession
     required property bool nativeRuntimeReady
     required property var nativeRuntimeCapabilities
     required property var refreshAccountServices
@@ -18,29 +19,25 @@ QtObject {
     signal accessibilityAnnounced(string message)
     signal errorReported(string message)
     property var settings: ({})
-    readonly property var keyboardLayoutItems: [
-        {label: "English (US)", value: "en-US"},
-        {label: "English (UK)", value: "en-GB"},
-        {label: "Türkçe (Q)", value: "tr-TR"},
-        {label: "Deutsch", value: "de-DE"},
-        {label: "Français", value: "fr-FR"},
-        {label: "Español", value: "es-ES"},
-        {label: "Español (Latinoamérica)", value: "es-MX"},
-        {label: "Italiano", value: "it-IT"},
-        {label: "Português (Portugal)", value: "pt-PT"},
-        {label: "Português (Brasil)", value: "pt-BR"},
-        {label: "Polski", value: "pl-PL"},
-        {label: "Dansk", value: "da-DK"},
-        {label: "Norsk", value: "nb-NO"},
-        {label: "Svenska", value: "sv-SE"},
-        {label: "Suomi", value: "fi-FI"},
-        {label: "Русский", value: "ru-RU"},
-        {label: "Українська", value: "uk-UA"},
-        {label: "日本語", value: "ja-JP"},
-        {label: "한국어", value: "ko-KR"},
-        {label: "中文（简体）", value: "zh-CN"},
-        {label: "中文（繁體）", value: "zh-TW"}
-    ]
+    property var confirmedSettings: ({})
+    property string providerIdpId: ""
+    property string providerCode: ""
+    readonly property string selectedRegion: {
+        const write = settingWrites.region
+        if (write) {
+            const provider = write.queued ? write.nextProviderIdpId : write.providerIdpId
+            const generation = write.queued ? write.nextScopeGeneration : write.scopeGeneration
+            if (provider === providerIdpId && generation === scopeGeneration)
+                return String(write.queued ? write.next : write.value)
+        }
+        const saved = settings.providerRegions || {}
+        if (saved[providerIdpId] !== undefined)
+            return String(saved[providerIdpId])
+        if (settings.regionProviderIdpId === providerIdpId
+                || (!settings.regionProviderIdpId && providerCode === "NVIDIA"))
+            return String(settings.region || "")
+        return ""
+    }
     property string previewThemePack: ""
     property string settingsRequestId: ""
     property string consoleSurfaceRequestId: ""
@@ -49,6 +46,331 @@ QtObject {
     property bool consoleSurfaceRequestValue: false
     property bool consoleSurfaceInitialized: false
     property string consoleSurfaceError: ""
+    property double scopeGeneration: 0
+    property bool nativeHdrOutputSupported: false
+    property bool settingsActive: false
+    property bool capabilitiesActive: false
+    property var keyboardLayouts: []
+    property var languageResult: ({})
+    property string languageState: "idle"
+    property string languageError: ""
+    property string languageRequestId: ""
+    property var colorDescriptors: []
+    property var codecDescriptors: []
+    property string colorRequestId: ""
+    property var frameRateDescriptors: []
+    property string cancellingRequestId: ""
+    property var settingWrites: ({})
+    property double settingWriteSequence: 0
+    property string shortcutUpdateRequestId: ""
+    property string shortcutUpdateError: ""
+    readonly property string languageContext: JSON.stringify([ready, scopeGeneration,
+        providerIdpId, settings.sessionProxyEnabled, settings.sessionProxyUrl])
+    readonly property string colorContext: JSON.stringify([ready, nativeRuntimeReady,
+        nativeRuntimeCapabilities, nativeHdrOutputSupported, settings.codec, settings.colorQuality, settings.nativeVideoBackend,
+        settings.decoderPreference, settings.enableHdr, settings.resolution])
+    readonly property string gameLanguageDescription: qsTr("Requested when the game supports it; some games require an in-game change. Applies to the next session.")
+    readonly property string keyboardLayoutDescription: qsTr("Physical key mapping requested from GeForce NOW. Applies to the next session.")
+    readonly property string interfaceLanguageDescription: qsTr("OpenNOW interface only. Community translated through Crowdin.")
+    readonly property string colorDescription: qsTr("Availability follows the current backend, codec and HDR output. Saved unsupported choices are preserved; launch validates the profile.")
+    readonly property bool softwareDecodeRequested: {
+        const backend = String(settings.nativeVideoBackend || "auto")
+        if (["auto", ""].indexOf(backend) < 0)
+            return ["software", "ffmpeg"].indexOf(backend) >= 0
+        return settings.decoderPreference === "software"
+    }
+
+    readonly property string languageStatusText: {
+        if (languageState === "loading") return qsTr("Loading game languages… Saved preferences are unchanged.")
+        if (languageState === "stale") return qsTr("Using stale cached game languages. %1").arg(languageError)
+        if (languageState === "error") return qsTr("Game language metadata unavailable. Saved preferences are unchanged. %1").arg(languageError)
+        if (languageState === "success") return languageResult.cacheHit === true
+            ? qsTr("Using cached game languages. This is not per-game support or entitlement.")
+            : qsTr("Global game languages. This is not per-game support or entitlement.")
+        return qsTr("Game language metadata has not been loaded. Saved preferences are unchanged.")
+    }
+    readonly property var interfaceLanguageItems: {
+        const revision = i18n ? i18n.revision : 0
+        const locales = i18n ? i18n.availableLocales : ["en"]
+        return ["system"].concat(locales).map(value => ({value:value,
+            label:i18n ? i18n.localeDisplayName(value) : value}))
+    }
+    readonly property var gameLanguageItems: {
+        const revision = i18n ? i18n.revision : 0
+        const values = languageResult.languages || []
+        const items = values.map(value => ({value:value,
+            label:i18n ? i18n.localeDisplayName(value) : value,
+            detail:languageState === "stale" ? qsTr("Stale cached metadata") : ""}))
+        if (!items.length) items.push({value:"en_US", label:i18n ? i18n.localeDisplayName("en_US") : "en_US", detail:qsTr("Local fallback; support not confirmed")})
+        const saved = String(settings.gameLanguage || "en_US")
+        if (!values.includes(saved)) {
+            const existing = items.find(item => item.value === saved)
+            const detail = values.length ? qsTr("Saved; not listed in current metadata") : qsTr("Saved; support not confirmed")
+            if (existing) existing.detail = detail
+            else items.unshift({value:saved, label:saved, detail:detail, disabled:true})
+        }
+        return items
+    }
+    readonly property var keyboardLayoutItems: {
+        const items = keyboardLayouts.map(item => ({value:item.value, label:i18n ? i18n.source(item.label) : item.label}))
+        const saved = String(settings.keyboardLayout || "en-US")
+        if (!items.some(item => item.value === saved)) {
+            const alias = keyboardLayouts.find(item => (item.aliases || []).includes(saved))
+            items.unshift({value:saved, label:saved, disabled:true,
+                detail:alias ? qsTr("Saved legacy ID; requests %1").arg(alias.value)
+                    : keyboardLayouts.length ? qsTr("Saved; layout not recognized") : qsTr("Saved; keyboard choices unavailable")})
+        }
+        return items
+    }
+    readonly property var colorQualityItems: [
+        ["8bit_420", qsTr("8-bit, YUV 4:2:0")], ["8bit_444", qsTr("8-bit, YUV 4:4:4")],
+        ["10bit_420", qsTr("10-bit, YUV 4:2:0")], ["10bit_444", qsTr("10-bit, YUV 4:4:4")]
+    ].map(pair => {
+        const descriptor = colorDescriptors.find(item => item.value === pair[0])
+        const gateReason = colorQualityGate(pair[0])
+        const blocked = gateReason !== "" || !descriptor || descriptor.disabled
+        return {value:pair[0], label:pair[1], disabled:blocked,
+            detail: pair[0].endsWith("_444") ? qsTr("Coming soon") : gateReason !== ""
+                ? gateReason
+                : descriptor ? String(descriptor.reason || qsTr("Supported by the current profile")) : qsTr("Capability not confirmed")}
+    })
+
+    function membershipTierName() {
+        const tier = (subscription && subscription.membershipTier)
+            || (authSession && authSession.user && authSession.user.membershipTier)
+            || ""
+        return String(tier).toUpperCase()
+    }
+
+    // 10-bit color precision and HDR10 require Ultimate or Performance.
+    // Unknown tiers fail open; the service remains the final arbiter.
+    function tenBitAllowedByMembership() {
+        return membershipTierName() !== "FREE"
+    }
+
+    function fourFourFourAllowedByMembership() {
+        const tier = membershipTierName()
+        return tier === "" || tier === "ULTIMATE"
+    }
+
+    // Membership/platform gates mirroring GeForce NOW's documented
+    // availability. Returns "" when allowed, else a display reason.
+    function colorQualityGate(value) {
+        const quality = String(value || "")
+        if (quality.indexOf("444") >= 0) {
+            if (Qt.platform.os !== "windows" && Qt.platform.os !== "osx")
+                return qsTr("Available in the Windows and macOS apps")
+            if (!fourFourFourAllowedByMembership())
+                return qsTr("Requires an Ultimate membership")
+        }
+        if (quality.indexOf("10bit") === 0 && !tenBitAllowedByMembership())
+            return qsTr("Requires a Performance or Ultimate membership")
+        return ""
+    }
+
+    onLanguageContextChanged: {
+        const request = languageRequestId
+        languageRequestId = ""
+        languageDeadline.stop()
+        languageResult = ({})
+        languageError = ""
+        languageState = "idle"
+        cancelOwnedRequest(request)
+        if (settingsActive && ready) Qt.callLater(root.ensureGameLanguages)
+    }
+    onSettingsActiveChanged: if (settingsActive) ensureGameLanguages()
+    onReadyChanged: {
+        if (!ready) {
+            const writes = settingWrites
+            settingWrites = ({})
+            for (const key of Object.keys(writes)) {
+                if (!ownsConfirmedSetting(key) && key !== "gameCollections")
+                    reconcileSetting(key, writes[key].coupledKeys)
+            }
+        }
+    }
+    onCapabilitiesActiveChanged: if (capabilitiesActive) colorRefresh.restart()
+    onColorContextChanged: {
+        const request = colorRequestId
+        colorRequestId = ""
+        colorDescriptors = []
+        codecDescriptors = []
+        frameRateDescriptors = []
+        cancelOwnedRequest(request)
+        if (capabilitiesActive) colorRefresh.restart()
+    }
+    property Timer languageDeadline: Timer {
+        interval: 15000
+        onTriggered: {
+            const request = root.languageRequestId
+            root.languageRequestId = ""
+            root.languageState = (root.languageResult.languages || []).length ? "stale" : "error"
+            root.languageError = qsTr("The request timed out. Retry when ready.")
+            root.cancelOwnedRequest(request)
+        }
+    }
+    property Timer colorRefresh: Timer {
+        interval: 0
+        onTriggered: {
+            if (!root.ready || !root.nativeRuntimeReady || !root.capabilitiesActive || root.colorRequestId !== "") return
+            root.colorRequestId = root.coreClient.request("settings.choices.get", {runtimeCapabilities:root.nativeRuntimeCapabilities}, 15000)
+        }
+    }
+
+    function ensureGameLanguages(refresh) {
+        const expired = languageState === "success" && Number(languageResult.expiresAt || 0) <= Date.now()
+        if (!ready || languageRequestId !== "" || (!refresh && languageState !== "idle" && !expired)) return
+        languageState = "loading"
+        languageError = ""
+        languageRequestId = coreClient.request("catalog.languages.get", {refresh:refresh === true}, 15000)
+        if (languageRequestId !== "") languageDeadline.restart()
+        else { languageState = "error"; languageError = qsTr("The request could not be started.") }
+    }
+
+    function cancelOwnedRequest(id) {
+        if (id === "") return
+        cancellingRequestId = id
+        coreClient.cancel(id)
+        cancellingRequestId = ""
+    }
+
+    function ownsConfirmedSetting(key) {
+        return ["appLanguage", "gameLanguage", "keyboardLayout", "colorQuality", "codec",
+            "nativeVideoBackend", "decoderPreference", "enableHdr"].includes(key)
+    }
+
+    function beginSettingWrite(key, value, previousWrite) {
+        const writes = Object.assign({}, settingWrites)
+        if (writes[key]) {
+            writes[key] = Object.assign({}, writes[key], {next:value, queued:true,
+                nextProviderIdpId:providerIdpId, nextScopeGeneration:scopeGeneration,
+                sequence:++settingWriteSequence})
+            settingWrites = writes
+            return writes[key].id
+        }
+        const id = coreClient.request("settings.set", {key:key, value:value, providerIdpId:providerIdpId}, 15000)
+        if (id === "") { errorReported(qsTr("The setting could not be saved.")); return "" }
+        const coupledKeys = previousWrite ? previousWrite.coupledKeys
+            : Object.keys(settingValues(key, value)).filter(changedKey => changedKey !== key)
+        const baseline = Object.assign({}, confirmedSettings)
+        for (const changedKey of [key].concat(coupledKeys)) {
+            if (!Object.prototype.hasOwnProperty.call(baseline, changedKey))
+                baseline[changedKey] = settings[changedKey]
+        }
+        confirmedSettings = baseline
+        writes[key] = {id:id, value:value, queued:false, providerIdpId:providerIdpId,
+            scopeGeneration:scopeGeneration,
+            sequence:previousWrite ? previousWrite.sequence : ++settingWriteSequence,
+            coupledKeys:coupledKeys,
+            initialValue:previousWrite ? previousWrite.initialValue : confirmedSettings[key]}
+        settingWrites = writes
+        return id
+    }
+
+    function finishSettingWrite(id, result, message) {
+        const key = Object.keys(settingWrites).find(key => settingWrites[key].id === id)
+        if (!key) return false
+        const write = settingWrites[key]
+        const confirmed = ownsConfirmedSetting(key)
+        const dispatchNext = write.queued && ready && (key !== "region"
+            || (write.nextProviderIdpId === providerIdpId && write.nextScopeGeneration === scopeGeneration))
+        const writes = Object.assign({}, settingWrites)
+        delete writes[key]
+        settingWrites = writes
+        if (result) {
+            confirmedSettings = Object.assign({}, confirmedSettings, result.changes || {}, {[key]:result.value})
+            write.coupledKeys = Array.from(new Set(write.coupledKeys.concat(Object.keys(result.changes || {}))))
+        }
+        if (result && confirmed) {
+            // Coupled values first (per protocol): core repairs persisted together
+            // with the primary key, e.g. an explicit codec the new color mode
+            // cannot use is healed toward Auto in the same save.
+            applyCoupledSettings(result.changes)
+            applySetting(key, result.value)
+        } else if (!result && confirmed && !dispatchNext) errorReported(message)
+        const nextId = dispatchNext ? beginSettingWrite(key, write.next, write) : ""
+        if (!nextId) {
+            if (!confirmed && key !== "gameCollections")
+                reconcileSetting(key, write.coupledKeys)
+            if (key === "identifyAsSteamDeck" && confirmedSettings[key] !== write.initialValue)
+                Qt.callLater(root.refreshAccountServices)
+        }
+        return confirmed
+    }
+
+    function reconcileSetting(key, coupledKeys) {
+        const keys = [key].concat(coupledKeys)
+        const values = ({})
+        for (const changedKey of keys)
+            values[changedKey] = confirmedSettings[changedKey]
+        const pendingKeys = Object.keys(settingWrites).sort((a, b) => settingWrites[a].sequence - settingWrites[b].sequence)
+        for (const pendingKey of pendingKeys) {
+            if (ownsConfirmedSetting(pendingKey) || pendingKey === "gameCollections") continue
+            const pending = settingWrites[pendingKey]
+            const changes = settingValues(pendingKey, pending.queued ? pending.next : pending.value)
+            for (const changedKey of keys) {
+                if (Object.prototype.hasOwnProperty.call(changes, changedKey))
+                    values[changedKey] = changes[changedKey]
+            }
+        }
+        for (const changedKey of keys)
+            applySetting(changedKey, values[changedKey])
+    }
+
+    function acceptResponse(id, result) {
+        if (id !== "" && id === languageRequestId) {
+            languageRequestId = ""
+            languageDeadline.stop()
+            if (Number(result.scopeGeneration) !== scopeGeneration) {
+                languageState = "error"
+                languageError = qsTr("The language metadata scope changed. Retry when ready.")
+                return true
+            }
+            languageResult = result
+            languageState = String(result.status || "error")
+            languageError = String(result.error && (result.error.message || result.error) || "")
+            return true
+        }
+        if (id !== "" && id === colorRequestId) {
+            colorRequestId = ""
+            colorDescriptors = result.colorQualities || []
+            codecDescriptors = result.codecs || []
+            frameRateDescriptors = result.frameRates || []
+            clampFpsToEntitlement()
+            return true
+        }
+        if (id !== "" && id === shortcutUpdateRequestId) {
+            applyCoupledSettings(result.bindings)
+            shortcutUpdateRequestId = ""
+            return true
+        }
+        return finishSettingWrite(id, result, "")
+    }
+
+    function acceptFailure(id, message) {
+        if (id !== "" && id === cancellingRequestId) return true
+        if (id !== "" && id === shortcutUpdateRequestId) {
+            shortcutUpdateError = message || qsTr("The shortcut could not be saved.")
+            shortcutUpdateRequestId = ""
+            accessibilityAnnounced(shortcutUpdateError)
+            return true
+        }
+        if (id !== "" && id === languageRequestId) {
+            languageRequestId = ""
+            languageDeadline.stop()
+            languageState = (languageResult.languages || []).length ? "stale" : "error"
+            languageError = message
+            return true
+        }
+        if (id !== "" && id === colorRequestId) {
+            colorRequestId = ""
+            colorDescriptors = []
+            codecDescriptors = []
+            frameRateDescriptors = []
+            return true
+        }
+        return finishSettingWrite(id, null, message)
+    }
 
     function refreshSettings() {
         if (!ready)
@@ -60,11 +382,13 @@ QtObject {
         const result = []
         const backends = capabilities && capabilities.videoBackends
             ? capabilities.videoBackends : []
+        const requested = String(settings.nativeVideoBackend || "auto")
+        const softwareRequested = softwareDecodeRequested
         for (let backendIndex = 0; backendIndex < backends.length; ++backendIndex) {
             const backend = backends[backendIndex]
-            const requested = String(settings.nativeVideoBackend || "auto")
-            if (!backend.available || ["software", "ffmpeg"].indexOf(backend.backend) >= 0
-                    || (requested !== "auto" && requested !== backend.backend
+            const software = ["software", "ffmpeg"].indexOf(backend.backend) >= 0
+            if (!backend.available || (softwareRequested ? !software : software)
+                    || (!softwareRequested && requested !== "auto" && requested !== backend.backend
                     && !(requested === "nvdec" && backend.backend === "cuda")))
                 continue
             const codecs = backend.codecs || []
@@ -92,50 +416,71 @@ QtObject {
             && codecNamesFromCapabilities(nativeRuntimeCapabilities).indexOf(name) >= 0
     }
 
+    function codecDescriptor(codec) {
+        const name = String(codec || "").toLowerCase()
+        for (let index = 0; index < codecDescriptors.length; ++index) {
+            if (String(codecDescriptors[index].value || "").toLowerCase() === name)
+                return codecDescriptors[index]
+        }
+        return null
+    }
+
+    // Core-resolved gating for the current color quality, backend, and HDR mode.
+    // Fails open while descriptors are unconfirmed: decoder capability gating
+    // (codecAvailable) still applies, and launch validation rejects the rest.
+    function codecDisabledByProfile(codec) {
+        const descriptor = codecDescriptor(codec)
+        return descriptor !== null && descriptor.disabled === true
+    }
+
+    function codecsDisabledByProfile() {
+        return ["av1", "h264", "h265"].filter(codec => codecDisabledByProfile(codec))
+    }
+
     function hdrDecoderAvailable() {
         return nativeRuntimeReady && settings.decoderPreference !== "software"
             && codecNamesFromCapabilities(nativeRuntimeCapabilities, true).length > 0
     }
 
-    function availableCodecValues() {
-        const result = []
-        if (codecAvailable("h264")) {
-            result.push("auto")
-            result.push("h264")
-        }
-        if (codecAvailable("h265"))
-            result.push("h265")
-        if (codecAvailable("av1"))
-            result.push("av1")
-        // Keep the persisted choice visible when the child is missing or the selected decoder
-        // policy has no compatible codec. Prelaunch validation still rejects it before CloudMatch.
-        return result.length ? result : [String(settings.codec || "auto").toLowerCase()]
-    }
-
-    function availableCodecLabels() {
-        const values = availableCodecValues()
-        const result = []
-        for (let index = 0; index < values.length; ++index) {
-            result.push(values[index] === "auto" ? "Auto"
-                : values[index] === "h264" ? "H.264"
-                : values[index] === "h265" ? "H.265" : "AV1")
-        }
-        return result
-    }
-
-    // Canonical frame rates offered by GeForce NOW clients. The Rust core
-    // clamps fps to 30–240, so 360 (an Electron-legacy preset) is excluded.
     function canonicalFpsValues() {
-        return [30, 60, 90, 120, 144, 165, 240]
+        return [30, 60, 90, 120, 144, 165, 240, 360]
     }
 
-    // Official catalog rates per resolution. 1080p rigs offer 240 FPS;
-    // other modes top out at 120 FPS. Exact MES tuples (e.g. 90 FPS) are
-    // preserved separately and never synthesized from a higher envelope.
     function presetFpsForResolution(width, height) {
         if (width === 1920 && (height === 1080 || height === 1200))
-            return [30, 60, 120, 240]
+            return [30, 60, 120, 240, 360]
         return [30, 60, 120]
+    }
+
+    readonly property var capabilityGatedFpsValues: [360]
+
+    function frameRateDescriptor(value) {
+        for (let index = 0; index < frameRateDescriptors.length; ++index) {
+            if (Number(frameRateDescriptors[index].value) === Number(value))
+                return frameRateDescriptors[index]
+        }
+        return null
+    }
+
+    function frameRateGated(value) {
+        return capabilityGatedFpsValues.indexOf(Number(value)) >= 0
+    }
+
+    function frameRateEligible(value) {
+        const descriptor = frameRateDescriptor(value)
+        if (descriptor !== null)
+            return descriptor.disabled !== true
+        return !frameRateGated(value)
+    }
+
+    function maxEntitledFps(resolution) {
+        const entitled = entitledFpsForResolution(resolution)
+        return entitled.length ? entitled[entitled.length - 1] : 0
+    }
+
+    function frameRateReason(value) {
+        const descriptor = frameRateDescriptor(value)
+        return descriptor && descriptor.disabled === true ? String(descriptor.reason || "") : ""
     }
 
     function isFpsCoveredByEntitlement(width, height, fps) {
@@ -195,25 +540,66 @@ QtObject {
         return locked
     }
 
-    // Clamp a requested fps to the nearest entitled rate at or below it,
-    // mirroring resolveEntitledStreamProfile. Returns the input when the
-    // subscription is unknown.
-    function resolveEntitledFps(resolution, requested) {
-        const entitled = entitledFpsForResolution(resolution)
-        if (entitled.length === 0)
-            return requested
-        const wanted = Math.trunc(Number(requested || 0))
-        if (wanted === 0 || entitled.indexOf(wanted) >= 0)
-            return wanted
-        for (let index = entitled.length - 1; index >= 0; --index) {
-            if (entitled[index] <= wanted)
-                return entitled[index]
-        }
-        return entitled[0]
+    function selectableFpsValues(resolution) {
+        const locked = lockedFpsValues(resolution)
+        return canonicalFpsValues().filter(value => locked.indexOf(value) < 0)
     }
 
-    // Persistently correct settings.fps when the resolution or subscription
-    // changed underneath it (e.g. tier downgrade). No-op while offline.
+    function knownLockedFpsValues(resolution) {
+        const locked = unentitledFpsValues(resolution)
+        const canonical = canonicalFpsValues()
+        for (let index = 0; index < canonical.length; ++index) {
+            const descriptor = frameRateDescriptor(canonical[index])
+            if (descriptor && descriptor.disabled === true && locked.indexOf(canonical[index]) < 0)
+                locked.push(canonical[index])
+        }
+        return locked
+    }
+
+    function lockedFpsValues(resolution) {
+        const locked = knownLockedFpsValues(resolution)
+        const canonical = canonicalFpsValues()
+        const entitled = entitledFpsForResolution(resolution)
+        for (let index = 0; index < canonical.length; ++index) {
+            const value = canonical[index]
+            const unconfirmed = frameRateGated(value)
+                && (entitled.indexOf(value) < 0 || !frameRateEligible(value))
+            if (unconfirmed && locked.indexOf(value) < 0)
+                locked.push(value)
+        }
+        return locked
+    }
+
+    function lockedFpsReason() {
+        const canonical = canonicalFpsValues()
+        for (let index = 0; index < canonical.length; ++index) {
+            const reason = frameRateReason(canonical[index])
+            if (reason !== "")
+                return reason
+        }
+        const locked = lockedFpsValues(settings.resolution)
+        for (let index = 0; index < locked.length; ++index) {
+            if (frameRateGated(locked[index]))
+                return qsTr("Capability not confirmed")
+        }
+        return ""
+    }
+
+    function resolveEntitledFps(resolution, requested) {
+        const locked = knownLockedFpsValues(resolution)
+        const selectable = canonicalFpsValues().filter(value => locked.indexOf(value) < 0)
+        if (selectable.length === 0)
+            return requested
+        const wanted = Math.trunc(Number(requested || 0))
+        if (wanted === 0 || selectable.indexOf(wanted) >= 0)
+            return wanted
+        for (let index = selectable.length - 1; index >= 0; --index) {
+            if (selectable[index] <= wanted)
+                return selectable[index]
+        }
+        return selectable[0]
+    }
+
     function clampFpsToEntitlement() {
         const clamped = resolveEntitledFps(settings.resolution, settings.fps)
         if (Number(clamped) !== Number(settings.fps))
@@ -247,15 +633,19 @@ QtObject {
                 ? [{label:"Metal / VideoToolbox", value:"videotoolbox"}]
                 : backends.filter(backend => ["vulkan", "cuda", "vaapi", "v4l2"].indexOf(backend.backend) >= 0)
                     .map(backend => ({label:String(backend.backend).toUpperCase(), value:backend.backend}))
+        if (Qt.platform.os !== "windows" && Qt.platform.os !== "osx")
+            choices.push({label: qsTr("Software (CPU)"), value: "software"})
         for (const choice of choices) {
-            const backend = backends.find(backend => backend.backend === choice.value)
-            result.push(Object.assign({}, choice, {
+            const backend = backends.find(backend => backend.backend
+                === (choice.value === "software" ? "ffmpeg" : choice.value))
+            result.push({label: choice.label, value: choice.value,
                 disabled: !nativeRuntimeReady || !backend || !backend.available,
                 detail: !nativeRuntimeReady ? qsTr("Checking hardware…")
                     : !backend ? qsTr("Not supported by this stream view")
-                    : backend.available ? qsTr("Hardware decoding")
+                    : backend.available ? (choice.value === "software"
+                        ? qsTr("CPU decoding; 8-bit 4:2:0 SDR only") : qsTr("Hardware decoding"))
                     : String(backend.reason || qsTr("Unavailable on this device"))
-            }))
+            })
         }
         return result
     }
@@ -303,16 +693,32 @@ QtObject {
         if (key === "launchInConsoleMode")
             return requestConsoleSurface(Boolean(value))
         if (!ready) {
+            if (!ownsConfirmedSetting(key) && Object.prototype.hasOwnProperty.call(confirmedSettings, key))
+                reconcileSetting(key, Object.keys(settingValues(key, value)).filter(changedKey => changedKey !== key))
             errorReported(qsTr("The OpenNOW core is not ready"))
             return ""
         }
-        const requestId = coreClient.request("settings.set", { key: key, value: value })
-        if (key === "identifyAsSteamDeck") {
-            // MES serves a different resolution catalog per device identity
-            // (Steam Deck unlocks 90 FPS tuples), so re-read entitlements.
-            Qt.callLater(root.refreshAccountServices)
+        const id = beginSettingWrite(key, value)
+        if (id !== "" && !ownsConfirmedSetting(key) && key !== "gameCollections")
+            applySetting(key, value)
+        else if (id === "" && !ownsConfirmedSetting(key)
+                 && Object.prototype.hasOwnProperty.call(confirmedSettings, key))
+            reconcileSetting(key, Object.keys(settingValues(key, value)).filter(changedKey => changedKey !== key))
+        return id
+    }
+
+    function updateShortcuts(bindings) {
+        if (shortcutUpdateRequestId !== "")
+            return ""
+        shortcutUpdateError = ""
+        if (!ready) {
+            shortcutUpdateError = qsTr("The OpenNOW core is not ready")
+            return ""
         }
-        return requestId
+        shortcutUpdateRequestId = coreClient.request("settings.shortcuts.update", {bindings: bindings}, 15000)
+        if (shortcutUpdateRequestId === "")
+            shortcutUpdateError = qsTr("The shortcut could not be saved.")
+        return shortcutUpdateRequestId
     }
 
     function resetSettings() {
@@ -328,16 +734,19 @@ QtObject {
             root.applySetting(key, changes[key])
     }
 
-    function applySetting(key, value) {
-        const updated = Object.assign({}, settings)
-        updated[key] = value
+    function settingValues(key, value) {
+        const updated = {[key]:value}
         if (key === "themePack") {
             updated.appTheme = value === "bone" || value === "cobalt" ? "light" : "dark"
             updated.themeAccentOverride = false
         } else if (key === "appAccentColor") {
             updated.themeAccentOverride = true
         }
-        settings = updated
+        return updated
+    }
+
+    function applySetting(key, value) {
+        settings = Object.assign({}, settings, settingValues(key, value))
         if (["nativeStreamerExecutablePath", "nativeVideoBackend", "decoderPreference"].indexOf(key) >= 0)
             Qt.callLater(root.refreshStreamerDetection)
         accessibilityAnnounced(qsTr("%1 updated").arg(String(key).split(/(?=[A-Z])/).join(" ")))
@@ -352,12 +761,29 @@ QtObject {
     }
 
     function acceptSettings(result) {
-        root.settings = Object.assign({}, result.settings)
-        root.consoleSurfaceConfirmedValue = Boolean(result.settings.launchInConsoleMode)
-        root.consoleSurfaceDesiredValue = root.consoleSurfaceConfirmedValue
-        root.consoleSurfaceInitialized = true
-        appController.reducedMotion = Boolean(result.settings.reducedMotion)
-        i18n.setLocale(String(result.settings.appLanguage || "system"))
+        const confirmed = Object.assign({}, result.settings)
+        const displayed = Object.assign({}, result.settings)
+        for (const key of Object.keys(settingWrites)) {
+            confirmed[key] = confirmedSettings[key]
+            displayed[key] = settings[key]
+            for (const coupledKey of settingWrites[key].coupledKeys) {
+                confirmed[coupledKey] = confirmedSettings[coupledKey]
+                displayed[coupledKey] = settings[coupledKey]
+            }
+        }
+        if (consoleSurfaceRequestId !== "") {
+            confirmed.launchInConsoleMode = consoleSurfaceConfirmedValue
+            displayed.launchInConsoleMode = consoleSurfaceDesiredValue
+        } else {
+            root.consoleSurfaceConfirmedValue = Boolean(result.settings.launchInConsoleMode)
+            root.consoleSurfaceDesiredValue = root.consoleSurfaceConfirmedValue
+            root.consoleSurfaceInitialized = true
+        }
+        root.confirmedSettings = confirmed
+        root.settings = displayed
+        root.keyboardLayouts = result.keyboardLayouts || []
+        appController.reducedMotion = Boolean(displayed.reducedMotion)
+        i18n.setLocale(String(displayed.appLanguage || "system"))
         root.settingsRequestId = ""
     }
 
@@ -387,6 +813,9 @@ QtObject {
     }
 
     function acceptSettingsChange(payload) {
+        const write = root.settingWrites[payload.key]
+        if (write) return
+        confirmedSettings = Object.assign({}, confirmedSettings, payload.changes || {}, {[payload.key]:payload.value})
         // Coupled preferences are saved atomically by the core.
         root.applyCoupledSettings(payload.changes)
         if (payload.key === "launchInConsoleMode") {

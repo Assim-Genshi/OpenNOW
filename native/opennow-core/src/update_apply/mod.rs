@@ -125,6 +125,38 @@ struct Acknowledgement {
     application: ProcessIdentity,
 }
 
+pub const WINDOWS_INSTALLER_REPLACEMENT_MESSAGE: &str = "This OpenNOW installation is registered with Windows Installer. Replace it once with setup.exe. In-app updates do not run Windows Installer.";
+
+pub fn windows_installer_replacement_message() -> Result<Option<&'static str>, String> {
+    #[cfg(windows)]
+    {
+        let Some(executable) = std::env::var_os("OPENNOW_APP_EXECUTABLE") else {
+            return Ok(None);
+        };
+        let Ok(executable) = canonical_file(Path::new(&executable)) else {
+            return Ok(None);
+        };
+        let Ok(root) = installation_target(InstallKind::WindowsMsi, &executable) else {
+            return Ok(None);
+        };
+        if managed::windows_managed(&root)? {
+            return Ok(Some(WINDOWS_INSTALLER_REPLACEMENT_MESSAGE));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(super) fn windows_update_package_extension(
+    msi_registered: bool,
+) -> Result<&'static str, String> {
+    if msi_registered {
+        Err(WINDOWS_INSTALLER_REPLACEMENT_MESSAGE.to_owned())
+    } else {
+        Ok("zip")
+    }
+}
+
 pub fn external_update_message() -> Option<&'static str> {
     if cfg!(target_os = "linux")
         && is_flatpak_installation(
@@ -181,11 +213,13 @@ pub fn compatible_package_extension() -> Result<&'static str, String> {
     require_native_updates()?;
     #[cfg(target_os = "linux")]
     {
-        Ok(if std::env::var_os("APPIMAGE").is_some() {
-            "appimage"
-        } else {
-            "deb"
-        })
+        Ok(
+            if std::env::var_os("APPIMAGE").is_some_and(|path| !path.is_empty()) {
+                "appimage"
+            } else {
+                "deb"
+            },
+        )
     }
     #[cfg(target_os = "macos")]
     {
@@ -197,16 +231,17 @@ pub fn compatible_package_extension() -> Result<&'static str, String> {
             .ok_or("Missing trusted application executable")?;
         let executable = canonical_file(Path::new(&executable))?;
         let root = installation_target(InstallKind::WindowsMsi, &executable)?;
-        Ok(if managed::windows_managed(&root)? {
-            "msi"
-        } else {
-            "zip"
-        })
+        windows_update_package_extension(managed::windows_managed(&root)?)
     }
 }
 
 pub fn prepare_update(request: PrepareRequest) -> Result<PreparedUpdate, String> {
     require_native_updates()?;
+    if request.kind == InstallKind::WindowsMsi {
+        return Err(WINDOWS_INSTALLER_REPLACEMENT_MESSAGE.to_owned());
+    }
+    #[cfg(target_os = "linux")]
+    validate_linux_install_kind(request.kind, std::env::var_os("APPIMAGE").as_deref())?;
     let package = canonical_file(&request.package)?;
     let manifest = read_manifest(&package)?;
     if manifest.version.trim_start_matches('v') != request.expected_version.trim_start_matches('v')
@@ -225,9 +260,7 @@ pub fn prepare_update(request: PrepareRequest) -> Result<PreparedUpdate, String>
         .matches_executable(&std::env::current_exe().map_err(|error| error.to_string())?)?;
     let target = installation_target(request.kind, &application)?;
     if request.kind == InstallKind::WindowsPortable && managed::windows_managed(&target)? {
-        return Err(
-            "Windows Installer owns this installation; a portable ZIP cannot replace it".to_owned(),
-        );
+        return Err(WINDOWS_INSTALLER_REPLACEMENT_MESSAGE.to_owned());
     }
     let data_dir = fs::canonicalize(&request.data_dir).map_err(|error| error.to_string())?;
     if (data_dir.starts_with(&target) && request.kind != InstallKind::WindowsPortable)
@@ -318,6 +351,21 @@ pub fn prepare_update(request: PrepareRequest) -> Result<PreparedUpdate, String>
         let _ = fs::remove_dir_all(&directory);
     }
     result
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_install_kind(
+    kind: InstallKind,
+    appimage: Option<&std::ffi::OsStr>,
+) -> Result<(), String> {
+    let is_appimage = appimage.is_some_and(|path| !path.is_empty());
+    if (kind == InstallKind::AppImage && is_appimage)
+        || (kind == InstallKind::DebianPackage && !is_appimage)
+    {
+        Ok(())
+    } else {
+        Err("Update package does not match the running Linux installation format".to_owned())
+    }
 }
 
 pub fn launch_prepared_update(prepared: &PreparedUpdate) -> Result<u32, String> {
@@ -571,6 +619,9 @@ fn validate_plan(plan: &Plan, directory: &Path) -> Result<(), String> {
 }
 
 fn apply(plan: &Plan, directory: &Path) -> Result<(), String> {
+    if plan.kind == InstallKind::WindowsMsi {
+        return Err(WINDOWS_INSTALLER_REPLACEMENT_MESSAGE.to_owned());
+    }
     let previous =
         read_outcome(&directory.join("outcome.json"))?.ok_or("Missing prepared update outcome")?;
     if previous.status != OutcomeStatus::Prepared {
@@ -1090,7 +1141,15 @@ fn preserve_portable_data(plan: &Plan, payload: &Path) -> Result<Vec<(PathBuf, P
         let entry = entry.map_err(|error| error.to_string())?;
         if !matches!(
             entry.file_name().to_str(),
-            Some("bin" | "share" | "LICENSE" | "THIRD_PARTY_NOTICES.json")
+            Some(
+                "bin"
+                    | "plugins"
+                    | "qml"
+                    | "share"
+                    | "translations"
+                    | "LICENSE"
+                    | "THIRD_PARTY_NOTICES.json"
+            )
         ) {
             sources.push(entry.path());
         }
@@ -1414,12 +1473,14 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
         #[cfg(windows)]
         {
             use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
             use windows_sys::Win32::Storage::FileSystem::{
                 MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
             };
             let old: Vec<_> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
             let new: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            if unsafe {
+            let start = Instant::now();
+            while unsafe {
                 MoveFileExW(
                     old.as_ptr(),
                     new.as_ptr(),
@@ -1427,7 +1488,18 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
                 )
             } == 0
             {
-                return Err(std::io::Error::last_os_error().to_string());
+                let error = std::io::Error::last_os_error();
+                if !matches!(
+                    error.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+                ) || start.elapsed() >= Duration::from_secs(1)
+                {
+                    return Err(format!(
+                        "Cannot publish update metadata at {}: {error}",
+                        path.display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
         #[cfg(not(windows))]

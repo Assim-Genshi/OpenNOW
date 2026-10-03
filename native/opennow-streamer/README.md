@@ -149,8 +149,9 @@ audio. This follows the native bundle findings documented in OpenNOW-Mac's
 `docs/StreamTransportArchitecture.md` (reference revision `88a09bd68598651b367aa4744e7528da9c074d28`).
 Legacy RTSP/UDP microphone carriage is not implemented.
 
-Capture produces mono 48 kHz PCM and an off-callback encoder produces 20 ms Opus
-frames at 32 kbps. PCM, encoded audio, and transport queues each hold at most five
+Capture produces mono 48 kHz PCM and an off-callback encoder produces 10 ms Opus
+frames at 32 kbps. The frame size must match the server's `mic.frameSize:10`: the
+cloud PC's microphone stays silent when it receives 20 ms frames. PCM, encoded audio, and transport queues each hold at most five
 frames and drop old data under load. Mute closes capture and clears pending audio;
 unmute preserves the RTP clock and transport sequence lifetime. Capture or uplink
 failure disables only the microphone, not game audio/video. Session termination
@@ -188,10 +189,20 @@ suppression are not provided by this capture path.
 ### Embedded session diagnostics
 
 Protocol 5 telemetry includes optional `jitterMs` (RTP interarrival jitter on
-the video 90 kHz clock) and `packetLossPercent` (cumulative authenticated RTP
-reception loss since stream start). Values are null before a stream is known.
-Reading these measurements does not advance RTCP report intervals. Qt forwards
+the video 90 kHz clock) and `packetLossPercent` (authenticated RTP reception loss
+over the latest sampled interval, normally one second). Loss sampling requires
+new traffic and an interval between one and three seconds. The first sample
+establishes a baseline and returns null. A longer gap, stream change, or counter
+reset starts a new baseline. Late recovery cannot produce negative loss. Sampling
+does not change cumulative RTCP loss or advance RTCP report intervals. Qt forwards
 measured values without converting nulls into zeros.
+
+Qt's shared connection-health state requires at least 0.5% loss sustained for two
+seconds before showing an unstable header or popup. A fresh sample below 0.1%
+restores healthy status and dismisses the loss popup. Missing or invalid samples,
+or five seconds without a fresh measurement, clear health to unknown. Historical
+video frame and audio packet drop totals remain unchanged. Loss popups keep their
+four-second lifetime and thirty-second cooldown across local overlay changes.
 
 The optional `pingMs` field measures network round-trip time on the active session. It prefers
 the nominated ICE candidate pair's measured RTT, then authenticated STUN/NATT replies

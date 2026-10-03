@@ -312,7 +312,9 @@ jobs:
         uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639
         with:
           key: ${{ runner.os == 'macOS' && 'qt-ci-macos-arm64' || format('qt-ci-{0}-{1}', matrix.os, matrix.label) }}
+          restore-keys: ${{ runner.os == 'macOS' && 'qt-ci-macos-arm64' || format('qt-ci-{0}-{1}', matrix.os, matrix.label) }}
           max-size: 1G
+          verbose: 1
 
       - name: Build and cache SDL3
         uses: ./.github/actions/sdl3
@@ -411,6 +413,22 @@ jobs:
           Expand-Archive $zip[0].FullName $zipExpanded
           Assert-OpenNowPackagePayload -Root $zipExpanded -DeploymentRoot build/opennow-qt-release/Release
 
+      - name: Build setup.exe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          SETUP_VERSION: ${{ needs.metadata.outputs.version }}
+          SETUP_ARCH: ${{ matrix.label == 'windows-arm64' && 'arm64' || 'x64' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = @(Get-ChildItem build/qt-packages -Filter *.zip)
+          if ($zip.Count -ne 1) { throw "Expected one portable ZIP" }
+          $payload = Join-Path $env:RUNNER_TEMP "setup-payload"
+          if (Test-Path $payload) { Remove-Item $payload -Recurse -Force }
+          Expand-Archive $zip[0].FullName $payload
+          $setup = Join-Path (Resolve-Path build/qt-packages) ([IO.Path]::GetFileNameWithoutExtension($zip[0].Name) + "-setup.exe")
+          ./opennow-qt/packaging/windows/build-setup.ps1 -Payload $payload -Version $env:SETUP_VERSION -Arch $env:SETUP_ARCH -OutputFile $setup
+
       - name: Create Linux AppImage
         if: runner.os == 'Linux'
         shell: bash
@@ -422,6 +440,8 @@ jobs:
           LINUXDEPLOY_SHA256: ${{ matrix.linuxdeploy-sha256 }}
           QT_PLUGIN_SHA256: ${{ matrix.qt-plugin-sha256 }}
           APPIMAGE_RUNTIME_SHA256: ${{ matrix.appimage-runtime-sha256 }}
+          BUILD_CHANNEL: ${{ inputs.channel }}
+          PACKAGE_ARCH: ${{ matrix.linuxdeploy-arch == 'aarch64' && 'arm64' || 'x64' }}
         run: |
           export LD_LIBRARY_PATH="$RUNNER_TEMP/SDL-install/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           mkdir -p build/qt-packages
@@ -442,6 +462,11 @@ jobs:
             --output "build/appimage-runtime-${LINUXDEPLOY_ARCH}"
           echo "$APPIMAGE_RUNTIME_SHA256  build/appimage-runtime-${LINUXDEPLOY_ARCH}" | sha256sum --check --strict
           chmod +x "build/linuxdeploy-${LINUXDEPLOY_ARCH}.AppImage" "build/linuxdeploy-plugin-qt-${LINUXDEPLOY_ARCH}.AppImage"
+          install -Dm644 opennow-qt/packaging/opennow-vaapi-hook.sh \
+            build/AppDir/apprun-hooks/opennow-vaapi-hook.sh
+          export LDAI_UPDATE_INFORMATION
+          LDAI_UPDATE_INFORMATION=$(python3 opennow-qt/packaging/appimage_updates.py information \
+            --channel "$BUILD_CHANNEL" --arch "$PACKAGE_ARCH")
           QMAKE="$QT_ROOT_DIR/bin/qmake" \
           QML_SOURCES_PATHS="$PWD/opennow-qt/qml" \
           LDAI_RUNTIME_FILE="$PWD/build/appimage-runtime-${LINUXDEPLOY_ARCH}" \
@@ -452,6 +477,10 @@ jobs:
               --icon-file build/AppDir/usr/share/icons/hicolor/scalable/apps/io.github.opencloudgaming.OpenNOW.svg \
               --library "$(pkg-config --variable=libdir libva)/libva.so.2" \
               --library "$(pkg-config --variable=libdir libva-drm)/libva-drm.so.2" \
+              --exclude-library libglib-2.0.so.0 \
+              --exclude-library libgobject-2.0.so.0 \
+              --exclude-library libgio-2.0.so.0 \
+              --exclude-library libgmodule-2.0.so.0 \
               --plugin qt \
               --output appimage
           test -f build/AppDir/usr/lib/libva.so.2
@@ -461,8 +490,11 @@ jobs:
           test -f build/AppDir/usr/plugins/platforms/libqwayland-generic.so
           test -f build/AppDir/usr/plugins/wayland-shell-integration/libxdg-shell.so
           LD_LIBRARY_PATH="$PWD/build/AppDir/usr/lib:$LD_LIBRARY_PATH" \
-            python3 opennow-qt/packaging/verify_linux_package.py build/AppDir/usr/bin
-          mv OpenNOW-Qt-*.AppImage build/qt-packages/
+            python3 opennow-qt/packaging/verify_linux_package.py build/AppDir/usr/bin --appdir build/AppDir
+          python3 opennow-qt/packaging/appimage_updates.py verify \
+            --channel "$BUILD_CHANNEL" --arch "$PACKAGE_ARCH" \
+            --appimage "OpenNOW-Qt-${OPENNOW_BUILD_VERSION}-Linux-${PACKAGE_ARCH}.AppImage"
+          mv OpenNOW-Qt-*.AppImage OpenNOW-Qt-*.AppImage.zsync build/qt-packages/
 
       - name: Create bundled Linux DEB
         if: runner.os == 'Linux'
@@ -497,10 +529,12 @@ jobs:
           name: opennow-qt-${{ matrix.label }}-unsigned
           path: |
             build/qt-packages/*.AppImage
+            build/qt-packages/*.AppImage.zsync
             build/qt-packages/*.deb
             build/qt-packages/*.dmg
             build/qt-packages/*.msi
             build/qt-packages/*.zip
+            build/qt-packages/*-setup.exe
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
@@ -622,11 +656,12 @@ jobs:
                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
               try:
                   core.stdin.write('{"type":"request","id":"package-core","method":"core.hello",'
-                                   '"params":{"protocolVersion":1}}\n')
+                                   '"params":{"protocolVersion":5}}\n')
                   core.stdin.flush()
                   assert select.select([core.stdout], [], [], 30)[0], "Core handshake timed out"
                   response = json.loads(core.stdout.readline())
                   assert response.get("id") == "package-core" and response.get("ok") is True, response
+                  assert {"catalog.libraryPages.v1", "catalog.metadata.v1", "account.syncObservation.v1", "catalog.languages.v1", "queue.servers.v1"}.issubset(response["result"]["capabilities"]), response
               finally:
                   core.kill()
                   core.communicate(timeout=5)
@@ -674,7 +709,7 @@ jobs:
         with:
           pattern: opennow-qt-*-unsigned
           path: unsigned-artifacts
-      - name: Verify all nine packages and prepare release checksums
+      - name: Verify the complete package set, including setup.exe, and prepare release checksums
         shell: bash
         run: |
           python3 opennow-qt/packaging/nightly_release.py assemble \

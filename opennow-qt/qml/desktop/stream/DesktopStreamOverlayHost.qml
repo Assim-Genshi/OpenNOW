@@ -10,7 +10,9 @@ FocusScope {
     property bool inputBlocking: false
     property bool pointerLocked: false
     property var frameGenerationStats: ({})
+    property var swapStats: ({})
     property bool notificationsEnabled: false
+    property bool connectionNotificationsEnabled: true
     focus: visible && inputBlocking
     readonly property bool present: menuView.present || exitView.present || statsVisible || notificationsEnabled
 
@@ -74,6 +76,7 @@ FocusScope {
         anchors.fill: parent
         visible: root.statsVisible
         frameGenerationStats: root.frameGenerationStats
+        swapStats: root.swapStats
         pointerLocked: root.pointerLocked
         focus: false
         expanded: root.overlay === "desktop-stream-stats-expanded"
@@ -84,6 +87,7 @@ FocusScope {
     }
 
     DesktopStreamToasts {
+        connectionNotificationsEnabled: root.connectionNotificationsEnabled
         controllers: ControllerInput.controllers
         anchors.right: parent.right
         anchors.rightMargin: 24

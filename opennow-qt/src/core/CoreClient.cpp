@@ -1,5 +1,6 @@
 #include "core/CoreClient.h"
 #include "diagnostics/DiagnosticsPaths.h"
+#include "media/MediaPaths.h"
 
 #ifndef OPENNOW_VERSION
 #define OPENNOW_VERSION "1.0.0"
@@ -12,8 +13,8 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QJsonArray>
 #include <QJsonParseError>
-#include <QStandardPaths>
 #include <QProcessEnvironment>
 
 using namespace Qt::StringLiterals;
@@ -207,15 +208,7 @@ bool CoreClient::start(const QString &program, const QStringList &arguments)
     environment.insert(u"OPENNOW_APP_EXECUTABLE"_s,
                        QFileInfo(QCoreApplication::applicationFilePath()).canonicalFilePath());
     environment.insert(u"OPENNOW_APP_PID"_s, QString::number(QCoreApplication::applicationPid()));
-#ifdef Q_OS_LINUX
-    if ((!environment.value(u"FLATPAK_ID"_s).isEmpty() || QFileInfo::exists(u"/.flatpak-info"_s))
-        && !environment.contains(u"OPENNOW_PICTURES_DIR"_s)) {
-        const auto pictures = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
-        if (!pictures.isEmpty()) {
-            environment.insert(u"OPENNOW_PICTURES_DIR"_s, pictures);
-        }
-    }
-#endif
+    environment.insert(u"OPENNOW_PICTURES_DIR"_s, mediaPicturesRoot());
     m_process.setProcessEnvironment(environment);
     m_process.start(program, arguments, QIODevice::ReadWrite | QIODevice::Unbuffered);
     return true;
@@ -261,15 +254,37 @@ void CoreClient::stop()
 
 QString CoreClient::request(const QString &method, const QJsonObject &params, int timeoutMs)
 {
-    if (method.trimmed().isEmpty() || m_process.state() != QProcess::Running) {
+    if (method.trimmed().isEmpty() || m_process.state() != QProcess::Running
+        || (m_state != u"ready"_s && !(m_state == u"handshaking"_s && method == u"core.hello"_s))) {
         return {};
     }
     const auto id = QString::number(m_nextRequestId++);
     const auto deadline = QDateTime::currentMSecsSinceEpoch() + qBound(100, timeoutMs, 300'000);
     auto runtimeParams = params;
-    if (method == u"session.create"_s || method == u"streamer.prepare"_s) {
+    if (method == u"session.create"_s || method == u"streamer.prepare"_s
+            || method == u"settings.choices.get"_s) {
         auto capabilities = runtimeParams.value(u"runtimeCapabilities"_s).toObject();
         capabilities.insert(u"nativeHdrSupported"_s, m_nativeHdrSupported);
+        if (m_nativeHdrDisplay.available) {
+            QJsonObject display{{u"minimumNits"_s, m_nativeHdrDisplay.minimumNits},
+                                {u"maximumNits"_s, m_nativeHdrDisplay.maximumNits}};
+            if (m_nativeHdrDisplay.maximumFullFrameNits)
+                display.insert(u"maximumFullFrameNits"_s, *m_nativeHdrDisplay.maximumFullFrameNits);
+            if (m_nativeHdrDisplay.chromaticity) {
+                const auto &c = *m_nativeHdrDisplay.chromaticity;
+                display.insert(u"redX"_s, c.redX);
+                display.insert(u"redY"_s, c.redY);
+                display.insert(u"greenX"_s, c.greenX);
+                display.insert(u"greenY"_s, c.greenY);
+                display.insert(u"blueX"_s, c.blueX);
+                display.insert(u"blueY"_s, c.blueY);
+                display.insert(u"whiteX"_s, c.whiteX);
+                display.insert(u"whiteY"_s, c.whiteY);
+            }
+            capabilities.insert(u"nativeHdrDisplay"_s, display);
+        } else {
+            capabilities.remove(u"nativeHdrDisplay"_s);
+        }
         runtimeParams.insert(u"runtimeCapabilities"_s, capabilities);
     }
     const QJsonObject message{{u"type"_s, u"request"_s},
@@ -449,14 +464,29 @@ void CoreClient::processLine(const QByteArray &line)
             pending->retryDelayMs = qMin(pending->retryDelayMs * 2, 1'000);
             return;
         }
+        const auto method = pending->message.value(u"method"_s).toString();
         m_pending.erase(pending);
         if (message.value(u"ok"_s).toBool(false)) {
+            if (method == u"session.create"_s
+                    && !writeMessage(QJsonObject{{u"type"_s, u"ack"_s}, {u"id"_s, id}})) {
+                emit requestFailed(id, u"core_write_failed"_s, u"Could not accept the allocated session"_s);
+                return;
+            }
             const auto result = message.value(u"result"_s).toObject();
             if (id == m_handshakeRequestId) {
                 const auto version = result.value(u"protocolVersion"_s).toInt(-1);
                 if (version != CurrentProtocolVersion) {
                     protocolFailure(u"Core protocol version is incompatible"_s);
                     return;
+                }
+                const auto capabilities = result.value(u"capabilities"_s).toArray();
+                for (const auto &capability : {u"catalog.libraryPages.v1"_s, u"catalog.metadata.v1"_s,
+                                             u"account.syncObservation.v1"_s, u"catalog.languages.v1"_s,
+                                             u"queue.servers.v1"_s}) {
+                    if (!capabilities.contains(capability)) {
+                        protocolFailure(u"The packaged core lacks a required capability: "_s + capability);
+                        return;
+                    }
                 }
                 m_restartAttempts = 0;
                 setState(u"ready"_s);
@@ -478,6 +508,10 @@ void CoreClient::processLine(const QByteArray &line)
 
     if (type == u"event"_s && message.value(u"name"_s).isString()
             && message.value(u"payload"_s).isObject()) {
+        if (message.value(u"name"_s).toString() == u"settings.changed"_s) {
+            emit eventReceived(u"settings.changed"_s, message.value(u"payload"_s).toObject());
+            return;
+        }
         if (m_events.size() >= MaximumQueuedEvents) {
             m_events.dequeue();
             ++m_droppedEvents;

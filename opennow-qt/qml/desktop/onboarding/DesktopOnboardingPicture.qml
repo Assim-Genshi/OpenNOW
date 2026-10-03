@@ -144,7 +144,7 @@ Column {
         }
         Text {
             width: DesktopTokens.px(72); height: DesktopTokens.px(28)
-            text: Math.round(slider.value) + control.suffix
+            text: (Math.round(slider.value * 100) / 100) + control.suffix
             color: Theme.label; font.family: Theme.monoFont; font.pixelSize: DesktopTokens.px(14); font.weight: Font.Bold
             verticalAlignment: Text.AlignVCenter; horizontalAlignment: Text.AlignRight
         }
@@ -189,19 +189,24 @@ Column {
                     description: qsTr("Rates follow your membership and resolution.")
                     Segments {
                         objectName: "onboardingFps"
+                        readonly property var canonical: root.store.canonicalFpsValues()
                         readonly property int current: Number(root.settings.fps ?? 60)
-                        options: [60,90,120,144,240].indexOf(current) >= 0 ? [60,90,120,144,240]
-                            : [{label: current === 0 ? qsTr("Auto") : String(current), value: current},60,90,120,144,240]
+                        options: canonical.indexOf(current) >= 0 ? canonical
+                            : [{label: current === 0 ? qsTr("Auto") : String(current), value: current}].concat(canonical)
                         optionWidth: 46
                         selectedIndex: options.findIndex(item => Number(optionValue(item)) === current)
-                        disabledValues: root.store.unentitledFpsValues(root.resolution)
-                        disabledHint: qsTr("Not available on your current membership")
+                        disabledValues: root.store.lockedFpsValues(root.resolution)
+                        disabledHint: root.store.unentitledFpsValues(root.resolution).length
+                            ? qsTr("Not available on your current membership")
+                            : root.store.lockedFpsReason()
+                                || qsTr("Not available on your current membership")
                         onSelected: (index, item) => root.store.setOnboardingSetting("fps", Number(optionValue(item)))
                     }
                 }
                 SettingRow {
                     id: hdrRow
-                    readonly property string status: HdrOutput.supported && !root.store.hdrDecoderAvailable()
+                    readonly property string status: !root.store.tenBitAllowedByMembership() ? qsTr("HDR10 requires a Performance or Ultimate membership.")
+                        : HdrOutput.supported && !root.store.hdrDecoderAvailable()
                         ? qsTr("HDR requires a supported 10-bit H.265 or AV1 hardware decoder.") : HdrOutput.status
                     width: parent.width; title: qsTr("HDR"); glyph: "sun"
                     description: !HdrOutput.supported ? qsTr("HDR is unavailable on this display.") : status
@@ -212,7 +217,7 @@ Column {
                     DesktopSettingsToggle {
                         objectName: "onboardingHdr"
                         checked: root.settings.enableHdr === true
-                        enabled: (HdrOutput.supported && root.store.hdrDecoderAvailable()) || checked
+                        enabled: ((HdrOutput.supported && root.store.hdrDecoderAvailable()) || checked) && (root.store.tenBitAllowedByMembership() || checked)
                         opacity: enabled ? 1 : 0.45
                         Accessible.name: qsTr("HDR")
                         Accessible.description: hdrRow.status
@@ -225,12 +230,12 @@ Column {
                     Segments {
                         objectName: "onboardingCodec"
                         options: [{label:qsTr("Auto"),value:"auto"},
-                            {label:"AV1",value:"av1",enabled:root.store.codecAvailable("av1")},
-                            {label:"H.265",value:"h265",enabled:root.store.codecAvailable("h265")},
-                            {label:"H.264",value:"h264",enabled:root.store.codecAvailable("h264")}]
+                            {label:"AV1",value:"av1",enabled:root.store.codecAvailable("av1") && !root.store.codecDisabledByProfile("av1")},
+                            {label:"H.265",value:"h265",enabled:root.store.codecAvailable("h265") && !root.store.codecDisabledByProfile("h265")},
+                            {label:"H.264",value:"h264",enabled:root.store.codecAvailable("h264") && !root.store.codecDisabledByProfile("h264")}]
                         optionWidth: 59
                         selectedIndex: options.findIndex(item => item.value === String(root.settings.codec || "auto"))
-                        disabledHint: qsTr("Not supported by the detected native decoder")
+                        disabledHint: qsTr("Not supported by the detected decoder or the selected color quality")
                         onSelected: (index, item) => root.store.setOnboardingSetting("codec", item.value)
                     }
                 }
@@ -241,9 +246,9 @@ Column {
                     BitrateSlider {
                         objectName: "onboardingBitrate"; accessibleName: qsTr("Bitrate")
                         trackWidth: Math.min(DesktopTokens.px(220), Math.max(DesktopTokens.px(100), bitrateRow.width - DesktopTokens.px(470)))
-                        from: 10; to: 200; stepSize: 5; suffix: qsTr(" Mbps")
+                        from: 0.22; to: 200; stepSize: 0.01; suffix: qsTr(" Mbps")
                         value: Number(root.settings.maxBitrateMbps ?? 75)
-                        onMoved: value => root.store.setOnboardingSetting("maxBitrateMbps", Math.round(value))
+                        onMoved: value => root.store.setOnboardingSetting("maxBitrateMbps", Math.round(value * 100) / 100)
                     }
                 }
             }

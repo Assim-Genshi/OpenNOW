@@ -43,15 +43,32 @@ add_custom_target(opennow-core ALL
 )
 add_dependencies(opennow-qt opennow-core)
 
+find_program(OPENNOW_LICENSE_RUSTC_EXECUTABLE rustc REQUIRED)
+execute_process(COMMAND "${OPENNOW_LICENSE_RUSTC_EXECUTABLE}" -vV
+    OUTPUT_VARIABLE OPENNOW_LICENSE_RUSTC_VERSION
+    RESULT_VARIABLE OPENNOW_LICENSE_RUSTC_RESULT)
+if(NOT OPENNOW_LICENSE_RUSTC_RESULT EQUAL 0)
+    message(FATAL_ERROR "Could not determine the license generator Rust host target")
+endif()
+string(REGEX MATCH "host: ([^\r\n]+)" OPENNOW_LICENSE_RUST_HOST_MATCH "${OPENNOW_LICENSE_RUSTC_VERSION}")
+set(OPENNOW_LICENSE_RUST_HOST "${CMAKE_MATCH_1}")
+if(NOT OPENNOW_LICENSE_RUST_HOST)
+    message(FATAL_ERROR "Could not parse the license generator Rust host target")
+endif()
+set(OPENNOW_LICENSE_HOST_SUFFIX "")
+if(CMAKE_HOST_WIN32)
+    set(OPENNOW_LICENSE_HOST_SUFFIX ".exe")
+endif()
 set(OPENNOW_GENERATED_NOTICES "${CMAKE_BINARY_DIR}/THIRD_PARTY_NOTICES.generated")
 add_custom_target(opennow-license-notices ALL
     COMMAND "${CARGO_EXECUTABLE}" build
             --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-core/Cargo.toml"
             --target-dir "${OPENNOW_CORE_TARGET_DIR}"
+            --target "${OPENNOW_LICENSE_RUST_HOST}"
             --bin opennow-license-report
             $<$<CONFIG:Release>:--release>
     COMMAND
-        "${OPENNOW_CORE_TARGET_DIR}/${OPENNOW_CORE_PROFILE}/opennow-license-report${OPENNOW_CORE_SUFFIX}"
+        "${OPENNOW_CORE_TARGET_DIR}/${OPENNOW_LICENSE_RUST_HOST}/${OPENNOW_CORE_PROFILE}/opennow-license-report${OPENNOW_LICENSE_HOST_SUFFIX}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../THIRD_PARTY_NOTICES"
         "${OPENNOW_GENERATED_NOTICES}"
         "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-core/Cargo.toml"
@@ -237,6 +254,39 @@ add_custom_command(
 )
 add_custom_target(opennow-streamer-ffi-build
     DEPENDS ${OPENNOW_STREAMER_FFI_ARTIFACTS})
+
+set(OPENNOW_STREAMER_PEER_PROBE_NAME "nvst-peer-probe")
+set(OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR "${CMAKE_BINARY_DIR}/peer-probe-rust-target")
+set(OPENNOW_STREAMER_PEER_PROBE_ARTIFACT_ROOT "${OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR}")
+if(OPENNOW_RUST_TARGET)
+    set(OPENNOW_STREAMER_PEER_PROBE_ARTIFACT_ROOT
+        "${OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR}/${OPENNOW_RUST_TARGET}")
+endif()
+set(OPENNOW_STREAMER_PEER_PROBE
+    "${OPENNOW_STREAMER_PEER_PROBE_ARTIFACT_ROOT}/release/${OPENNOW_STREAMER_PEER_PROBE_NAME}")
+add_custom_command(
+    OUTPUT "${OPENNOW_STREAMER_PEER_PROBE}"
+    COMMAND "${CMAKE_COMMAND}" -E env --unset=MAKEFLAGS --unset=MFLAGS
+            "CMAKE=${CMAKE_COMMAND}"
+            "${CARGO_EXECUTABLE}" build
+            --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer/Cargo.toml"
+            --target-dir "${OPENNOW_STREAMER_PEER_PROBE_TARGET_DIR}"
+            --package opennow-streamer-transport
+            --features sony-peer-probe
+            --bin nvst-peer-probe
+            ${OPENNOW_RUST_TARGET_ARGS}
+            --release
+    DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer/Cargo.lock"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer/Cargo.toml"
+        ${OPENNOW_STREAMER_RUST_SOURCES}
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../native/opennow-streamer"
+    COMMENT "Building the Sony chain RTC peer probe"
+    COMMAND_EXPAND_LISTS
+    VERBATIM
+)
+add_custom_target(opennow-streamer-peer-probe
+    DEPENDS "${OPENNOW_STREAMER_PEER_PROBE}")
 
 # The Rust core still probes streamer capabilities through the standalone
 # streamer executable next to opennow-core, so build and ship it alongside

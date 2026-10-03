@@ -21,6 +21,7 @@ set(OPENNOW_STREAM_PRESENTATION_SOURCES
     src/streaming/rendering/NativeStreamRenderCallback.h
     src/streaming/rendering/StreamVideoItemRendering.cpp
     src/streaming/rendering/StreamVideoRenderCallback.h
+    src/streaming/rendering/StreamPresentTimings.h
     src/streaming/rendering/StreamVideoTextureRenderer.h
     src/streaming/rendering/StreamFrameInterpolator.cpp
     src/streaming/rendering/StreamFrameInterpolator.h
@@ -57,6 +58,8 @@ qt_add_executable(opennow-qt
     src/diagnostics/DiagnosticsPaths.h
     src/input/ControllerInput.cpp
     src/input/ControllerInput.h
+    src/input/SdlDeviceClaim.h
+    src/input/SonySnapshotWire.h
     src/input/InputModeTracker.cpp
     src/input/InputModeTracker.h
     src/localization/Localization.cpp

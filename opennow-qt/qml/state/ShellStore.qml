@@ -7,6 +7,11 @@ import "account"
 QtObject {
     id: root
     signal backgroundStreamReminderRequested()
+    property ConnectionHealthState connectionHealth: ConnectionHealthState {
+        active: root.activeSession !== null && root.streamerStatus === "streaming"
+            && !root.streamerStopExpected
+        sessionId: String(root.activeSession && root.activeSession.sessionId || "")
+    }
     property BackgroundStreamState backgroundStreamState: BackgroundStreamState {
         settings: root.settings
         applicationActive: Qt.application.state === Qt.ApplicationActive
@@ -24,8 +29,15 @@ QtObject {
         settings: root.settings
         setSetting: root.setSetting
         applySetting: root.applySetting
+        acceptsScope: root.matchesAuthScope
+        authScope: ({generation:root.authGeneration, userId:root.authSession && root.authSession.user ? root.authSession.user.userId : "",
+            providerIdpId:root.authSession && root.authSession.provider ? root.authSession.provider.idpId : ""})
+        detailVisible: AppController.route === "game-detail"
+        definitions: accountServicesOwner.catalogDefinitions
         onAccessibilityAnnounced: message => root.accessibilityMessage = message
         onStoreSessionReset: root.storeSessionReset()
+        onLaunchContextInvalidated: root.invalidateLaunchInspection()
+        onLibraryRefreshFinished: (complete, message) => accountServicesOwner.libraryRefreshFinished(complete, message)
     }
 
     property ArtworkState artworkOwnerState: ArtworkState {
@@ -41,6 +53,13 @@ QtObject {
         i18n: I18n
         ready: root.ready
         subscription: root.subscription
+        authSession: root.authSession
+        scopeGeneration: root.authGeneration
+        settingsActive: String(AppController.route).indexOf("settings") === 0
+        capabilitiesActive: String(AppController.route).indexOf("settings") === 0 || root.onboardingRequired
+        nativeHdrOutputSupported: HdrOutput.supported
+        providerIdpId: root.authSession && root.authSession.provider ? String(root.authSession.provider.idpId || "") : ""
+        providerCode: root.authSession && root.authSession.provider ? String(root.authSession.provider.code || "") : ""
         nativeRuntimeReady: root.nativeRuntimeReady
         nativeRuntimeCapabilities: root.nativeRuntimeCapabilities
         refreshAccountServices: root.refreshAccountServices
@@ -59,12 +78,14 @@ QtObject {
         appController: AppController
         ready: root.ready
         signedIn: root.signedIn
-        reloadCatalogForSession: root.reloadCatalogForSession
+        refreshCatalogAfterAccountChange: catalogOwner.refreshCatalogAfterAccountChange
         refreshAccountServices: root.refreshAccountServices
+        acceptsScope: root.matchesAuthScope
         onAccessibilityAnnounced: message => root.accessibilityMessage = message
     }
 
     property alias settings: settingsOwner.settings
+    readonly property string selectedRegion: settingsOwner.selectedRegion
     property alias keyboardLayoutItems: settingsOwner.keyboardLayoutItems
     property var onboardingAwdlController: MacAwdl
     readonly property bool onboardingAwdlReady: !onboardingAwdlController.busy
@@ -137,13 +158,55 @@ QtObject {
     property alias previewThemePack: settingsOwner.previewThemePack
     property string accessibilityMessage: ""
     property alias settingsRequestId: settingsOwner.settingsRequestId
+    property alias shortcutUpdateRequestId: settingsOwner.shortcutUpdateRequestId
+    property alias shortcutUpdateError: settingsOwner.shortcutUpdateError
     property string lastError: ""
     property var focusPositions: ({})
     property var providers: []
+    property string selectedProviderIdpId: ""
+    readonly property var selectedProvider: selectedProviderIdpId === ""
+        ? (providers.length ? providers[0] : null)
+        : (providers.find(provider => provider.idpId === selectedProviderIdpId) || null)
+    property bool providerDiscoveryDegraded: false
+    property int providerRetryAttempts: 0
+    property Timer providerRetryTimer: Timer {
+        interval: 31000
+        repeat: false
+        onTriggered: {
+            root.providerRetryAttempts += 1
+            root.refreshProviders()
+        }
+    }
+
+    function refreshProviders(manual) {
+        if (!ready || providersRequestId !== "") return
+        if (manual === true) {
+            providerRetryAttempts = 0
+            providerRetryTimer.stop()
+        }
+        providersRequestId = CoreClient.request("auth.providers.list", {}, 10000)
+        if (providersRequestId === "") scheduleProviderRetry(0)
+    }
+
+    function scheduleProviderRetry(retryAfterMs) {
+        providerDiscoveryDegraded = true
+        if (ready && providerRetryAttempts < 3) {
+            providerRetryTimer.interval = Math.max(31000, Number(retryAfterMs || 0) + 1000)
+            providerRetryTimer.restart()
+        }
+    }
     property var authSession: null
     property var authChallenge: null
     property string authState: "idle"
     property string authMessage: ""
+    property bool addingAccount: false
+    property string accountMessage: ""
+    property Connections accountNavigation: Connections {
+        target: AppController
+        function onRouteChanged() {
+            if (AppController.route !== "sign-in") root.addingAccount = false
+        }
+    }
     property alias catalogGames: catalogOwner.catalogGames
     readonly property var gameCollections: catalogOwner.gameCollections
     property alias activeCollectionId: catalogOwner.activeCollectionId
@@ -165,6 +228,15 @@ QtObject {
     property alias selectedGame: catalogOwner.selectedGame
     property alias catalogTotalCount: catalogOwner.catalogTotalCount
     property alias catalogState: catalogOwner.catalogState
+    property alias catalogComplete: catalogOwner.catalogComplete
+    property alias catalogError: catalogOwner.catalogError
+    property alias catalogNextCursor: catalogOwner.catalogNextCursor
+    property alias catalogLastCompleteAt: catalogOwner.catalogLastCompleteAt
+    function continueCatalog() { catalogOwner.continueCatalog() }
+    function refreshSelectedMetadata() { catalogOwner.refreshSelectedMetadata() }
+    function readinessNotice(game) { return catalogOwner.readinessNotice(game) }
+    function catalogGenreLabel(genre) { return catalogOwner.genreLabel(genre) }
+    property alias detailMetadataError: catalogOwner.detailError
     property alias catalogSource: catalogOwner.catalogSource
     property alias storeGames: catalogOwner.storeGames
     property alias storeFacets: catalogOwner.storeFacets
@@ -193,6 +265,8 @@ QtObject {
     property alias storePanels: catalogOwner.storePanels
     property alias storeFilterGroups: catalogOwner.storeFilterGroups
     property string sessionPersistence: "none"
+    property double authGeneration: 0
+    property var authWarnings: []
     property bool authRestorePending: true
     property bool pendingStaySignedIn: true
     signal consoleSurfaceRequested(bool enabled)
@@ -213,6 +287,10 @@ QtObject {
     property alias gameAccounts: accountServicesOwner.gameAccounts
     property alias gameAccountsState: accountServicesOwner.gameAccountsState
     property alias gameAccountMessage: accountServicesOwner.gameAccountMessage
+    property alias syncOperation: accountServicesOwner.syncOperation
+    function cancelSyncObservation() { accountServicesOwner.cancelSyncObservation() }
+    function storeSubscriptionLabels(account) { return accountServicesOwner.storeSubscriptionLabels(account) }
+    function gameAccountAction(account) { return accountServicesOwner.gameAccountAction(account) }
     property alias accountLinkAttempt: accountServicesOwner.accountLinkAttempt
     property alias storageLocations: accountServicesOwner.storageLocations
     property alias storageMessage: accountServicesOwner.storageMessage
@@ -224,11 +302,14 @@ QtObject {
     property string diagnosticsMessage: ""
     property var updaterState: ({status: "idle", currentVersion: Qt.application.version, canCheck: false})
     property string updaterError: ""
+    property string updaterFailureMessage: ""
     property bool updaterInstallConfirmed: false
     property bool updaterExitScheduled: false
     property bool updaterReconciling: false
     property double lastAutoUpdateCheckMs: 0
     property string autoDownloadAttempt: ""
+    property int autoDownloadAttemptCount: 0
+    property double autoDownloadAttemptMs: 0
     readonly property bool updaterSessionSafe: !activeSession && !streamBusy && !sessionRecoveryPending
         && activeSessionRequestId === "" && sessionClaimRequestId === "" && streamCreateRequestId === ""
         && streamerStartRequestId === "" && streamerPrepareRequestId === "" && streamerStopRequestId === ""
@@ -263,11 +344,26 @@ QtObject {
     property string pinTargetName: qsTr("Profile")
     property string pinMessage: ""
     property var activeSession: null
+    property string colorFormatSessionId: ""
+    property string pendingRequestedColorQuality: ""
+    property string streamRequestedColorQuality: ""
+    property var streamColorFormat: null
+    property var streamColorNotice: null
+    property bool streamColorNoticeShown: false
+    property bool streamColorProfileObserved: false
     property string dropSessionId: ""
     property string sessionReportDropId: ""
     property var streamDropCounts: ({})
     onActiveSessionChanged: {
         const sessionId = String(activeSession && activeSession.sessionId || "")
+        if (sessionId !== colorFormatSessionId) {
+            colorFormatSessionId = sessionId
+            streamRequestedColorQuality = ""
+            streamColorFormat = null
+            streamColorNotice = null
+            streamColorNoticeShown = false
+            streamColorProfileObserved = false
+        }
         if (sessionId !== "" && sessionId !== dropSessionId) {
             dropSessionId = sessionId
             streamDropCounts = {videoDropCount: 0, audioDiscardedMs: 0,
@@ -280,6 +376,244 @@ QtObject {
     }
     property var remoteSessions: []
     property var pendingLaunchParams: null
+    property string launchInspectRequestId: ""
+    property string launchInspectStage: ""
+    property string launchInspectSeatId: ""
+    property string directLookupRequestId: ""
+    property var storeLaunchTarget: null
+    property string storeLaunchRequestId: ""
+    property var storeLaunchDecision: ({status:"metadata_unconfirmed", message:""})
+    property bool storeLaunchFailed: false
+    property alias ownershipConfirmation: catalogOwner.ownershipConfirmation
+    property alias selectedLaunchDecision: catalogOwner.selectedLaunchDecision
+    property alias cloudMutationBusy: catalogOwner.mutationBusy
+    property alias cloudMutationState: catalogOwner.mutationState
+    property alias cloudMutationMessage: catalogOwner.mutationMessage
+    property alias remoteFavorites: catalogOwner.remoteFavorites
+    property alias remoteFavoritesState: catalogOwner.favoritesState
+    property alias remoteFavoritesError: catalogOwner.favoritesError
+    function isCloudFavorite(game) { return catalogOwner.isCloudFavorite(game) }
+    function toggleCloudFavorite(game) { catalogOwner.toggleCloudFavorite(game) }
+    function requestOwnershipConfirmation(action) { catalogOwner.requestOwnershipConfirmation(action) }
+    function confirmOwnership() { catalogOwner.confirmOwnership() }
+    function selectPreferredVariant() { catalogOwner.selectPreferredVariant() }
+    function refreshCloudFavorites() { catalogOwner.refreshFavorites() }
+    function selectedGameActionLabel() {
+        if (!signedIn) return qsTr("Sign in")
+        if (cloudMutationBusy || launchInspectRequestId !== "") return qsTr("Checking…")
+        if (selectedLaunchDecision.status === "ownership_required") return qsTr("I own this game")
+        if (selectedLaunchDecision.status === "selection_required") return qsTr("Use this store version")
+        if (selectedLaunchDecision.status === "ready") return qsTr("Play")
+        return qsTr("Check availability")
+    }
+    function activateSelectedGame() {
+        if (selectedLaunchDecision.status === "ownership_required") requestOwnershipConfirmation("add")
+        else if (selectedLaunchDecision.status === "selection_required") selectPreferredVariant()
+        else launchSelectedGame()
+    }
+    function invalidateLaunchInspection() {
+        const id = launchInspectRequestId
+        launchInspectRequestId = ""
+        launchInspectStage = ""
+        launchInspectSeatId = ""
+        if (id !== "") CoreClient.cancel(id)
+    }
+    function launchIntentCurrent() {
+        return ready && signedIn && pendingLaunchParams
+            && pendingLaunchParams.selectionIdentity === catalogOwner.selectedIdentity
+            && pendingLaunchParams.authGeneration === authGeneration
+            && pendingLaunchParams.actionGeneration === catalogOwner.actionGeneration
+            && pendingLaunchParams.requestContextKey === catalogOwner.requestContextKey
+            && !catalogOwner.mutationBusy
+    }
+    function inspectLaunch(stage) {
+        if (launchInspectRequestId !== "") return
+        if (!launchIntentCurrent()) {
+            streamState = "error"
+            streamMessage = qsTr("The selected game or account changed. Choose the store version again.")
+            lastError = streamMessage
+            return
+        }
+        launchInspectStage = stage
+        launchInspectSeatId = stage === "stop" && conflictSession ? String(conflictSession.sessionId) : ""
+        const inspectParams = {
+            appId:pendingLaunchParams.catalogAppId, variantId:pendingLaunchParams.variantId
+        }
+        if (pendingLaunchParams.storeLaunch === true)
+            inspectParams.storeLaunch = true
+        launchInspectRequestId = CoreClient.request("catalog.launch.inspect", inspectParams, 30000)
+    }
+    function invalidateStoreLaunch() {
+        const id = storeLaunchRequestId
+        storeLaunchRequestId = ""
+        storeLaunchTarget = null
+        storeLaunchFailed = false
+        storeLaunchDecision = {status:"metadata_unconfirmed", message:""}
+        if (id !== "") CoreClient.cancel(id)
+    }
+    function failStoreLaunch(decision) {
+        storeLaunchTarget = null
+        storeLaunchFailed = true
+        storeLaunchDecision = decision
+        if (AppController.route !== "persistent-storage")
+            AppController.navigate("persistent-storage")
+    }
+    function inspectStoreLaunch() {
+        if (!ready || !signedIn || storeLaunchRequestId !== "")
+            return
+        storeLaunchFailed = false
+        storeLaunchRequestId = CoreClient.request("catalog.launch.store.inspect", {}, 30000)
+    }
+    function launchStoreGame() {
+        const target = storeLaunchTarget
+        if (!target || storeLaunchDecision.status !== "ready" || !target.game)
+            return
+        if (!signedIn) {
+            AppController.navigate("sign-in")
+            return
+        }
+        const variants = target.game.variants || []
+        const index = variants.findIndex(variant => String(variant.id) === String(target.variantId))
+        if (index < 0)
+            return
+        selectedGame = Object.assign({}, target.game, {selectedVariantIndex:index})
+        launchSelectedGame(false)
+    }
+    property Connections launchInspectionResponses: Connections {
+        target: CoreClient
+        function onResponseReceived(id, result) {
+            if (id !== "" && id === root.directLookupRequestId) {
+                root.directLookupRequestId = ""
+                const requested = root.pendingDirectLaunch
+                if (!requested || !root.matchesAuthScope(result.scope) || !result.game) return
+                const index = (result.game.variants || []).findIndex(variant => String(variant.id) === requested.appId)
+                if (index < 0) {
+                    root.lastError = qsTr("The exact requested store version was not returned.")
+                    root.pendingDirectLaunch = null
+                    return
+                }
+                root.selectedGame = Object.assign({}, result.game, {selectedVariantIndex:index})
+                root.pendingDirectLaunch = null
+                root.launchSelectedGame(true)
+                return
+            }
+            if (id !== "" && id === root.storeLaunchRequestId) {
+                root.storeLaunchRequestId = ""
+                root.storeLaunchFailed = false
+                if (!root.matchesAuthScope(result.scope)) {
+                    root.storeLaunchTarget = null
+                    root.storeLaunchDecision = {status:"metadata_unconfirmed",
+                        message:qsTr("The account changed. Refresh the store launch and try again.")}
+                    return
+                }
+                root.storeLaunchDecision = result.decision || {status:"metadata_unconfirmed", message:""}
+                const ready = result.decision && result.decision.status === "ready"
+                    && result.game && result.appId && result.variantId
+                root.storeLaunchTarget = ready ? {
+                    appId:String(result.appId), variantId:String(result.variantId),
+                    title:String(result.game.title || "Steam"), game:result.game
+                } : null
+                return
+            }
+            if (id === "" || id !== root.launchInspectRequestId) return
+            const stage = root.launchInspectStage
+            const seatId = root.launchInspectSeatId
+            root.launchInspectRequestId = ""
+            root.launchInspectStage = ""
+            root.launchInspectSeatId = ""
+            const storeOriginated = root.pendingLaunchParams
+                && root.pendingLaunchParams.storeLaunch === true
+            if (!root.launchIntentCurrent() || !root.matchesAuthScope(result.scope)
+                    || result.appId !== root.pendingLaunchParams.catalogAppId || result.variantId !== root.pendingLaunchParams.variantId) {
+                root.streamState = "error"
+                root.streamMessage = qsTr("The selected game or account changed. Choose the store version again.")
+                root.lastError = root.streamMessage
+                if (storeOriginated) {
+                    root.pendingLaunchParams = null
+                    root.failStoreLaunch({status:"metadata_unconfirmed", message:root.streamMessage})
+                }
+                return
+            }
+            const variant = result.game && result.game.id === root.pendingLaunchParams.catalogAppId
+                ? (result.game.variants || []).find(item => String(item.id) === root.pendingLaunchParams.variantId) : null
+            if (!variant) {
+                root.streamState = "error"
+                root.streamMessage = qsTr("The exact requested store version was not returned.")
+                root.lastError = root.streamMessage
+                if (storeOriginated) {
+                    root.pendingLaunchParams = null
+                    root.failStoreLaunch({status:"metadata_unconfirmed", message:root.streamMessage})
+                }
+                return
+            }
+            catalogOwner.adoptGame(result.game)
+            root.pendingLaunchParams = Object.assign({}, root.pendingLaunchParams, {
+                accountLinked:variant.inLibrary === true,
+                supportsInGameSettingsPersistence:variant.supportsInGameSettingsPersistence === true,
+                title:result.game.title
+            })
+            root.selectedLaunchDecision = result.decision || ({status:"metadata_unconfirmed", message:""})
+            if (root.selectedLaunchDecision.status !== "ready") {
+                root.streamState = "error"
+                root.streamMessage = root.selectedLaunchDecision.message || qsTr("Availability could not be confirmed. Refresh and try again.")
+                root.lastError = root.streamMessage
+                root.pendingLaunchParams = null
+                if (storeOriginated)
+                    root.failStoreLaunch(root.selectedLaunchDecision)
+                else
+                    AppController.navigateFromLastPrimary("game-detail")
+                return
+            }
+            if (stage === "discover") {
+                root.continueInspectedLaunch()
+            } else if (stage === "stop") {
+                if (!root.conflictSession || String(root.conflictSession.sessionId) !== seatId) {
+                    root.streamState = "error"
+                    root.streamMessage = qsTr("The running session changed. Check your sessions again before replacing a game.")
+                    root.lastError = root.streamMessage
+                    return
+                }
+                root.forceNewAfterStop = true
+                root.streamState = "stopping"
+                root.streamMessage = qsTr("Closing the previous cloud session…")
+                root.streamStopRequestId = CoreClient.request("session.stop", {
+                    sessionId:root.conflictSession.sessionId, streamingBaseUrl:root.conflictSession.streamingBaseUrl,
+                    serverIp:root.conflictSession.serverIp || ""
+                }, 35000)
+            } else if (stage === "create") {
+                root.streamState = "requesting"
+                root.pendingRequestedColorQuality = String(root.settings.colorQuality || "8bit_420")
+                root.streamCreateRequestId = CoreClient.request("session.create",
+                    Object.assign({}, root.pendingLaunchParams, {
+                        runtimeCapabilities: root.nativeRuntimeCapabilities,
+                        maxEntitledFps: settingsOwner.maxEntitledFps(String(root.settings.resolution || ""))
+                    }), 60000)
+            }
+        }
+        function onRequestFailed(id, code, message) {
+            if (id !== "" && id === root.directLookupRequestId) {
+                root.directLookupRequestId = ""
+                root.pendingDirectLaunch = null
+                root.lastError = message
+            } else if (id !== "" && id === root.launchInspectRequestId) {
+                root.launchInspectRequestId = ""
+                root.launchInspectStage = ""
+                root.launchInspectSeatId = ""
+                root.streamState = "error"
+                root.streamMessage = message
+                root.lastError = message
+                if (root.pendingLaunchParams && root.pendingLaunchParams.storeLaunch === true) {
+                    root.pendingLaunchParams = null
+                    root.failStoreLaunch({status:"metadata_unconfirmed", message:message})
+                }
+            } else if (id !== "" && id === root.storeLaunchRequestId) {
+                root.storeLaunchRequestId = ""
+                root.storeLaunchTarget = null
+                root.storeLaunchFailed = true
+                root.storeLaunchDecision = {status:"metadata_unconfirmed", message:message}
+            }
+        }
+    }
     property var pendingDirectLaunch: null
     property var conflictSession: null
     property bool conflictSessionNeedsRefresh: false
@@ -290,11 +624,17 @@ QtObject {
     property string streamerDetectionMessage: qsTr("Checking native codec support…")
     property string streamState: "idle"
     property string streamMessage: ""
+    property SessionSetupProgress sessionSetupProgress: SessionSetupProgress {
+        session: root.activeSession
+    }
     property int streamerRestartAttempts: 0
     property bool streamerRecoveryExhausted: false
     property int sessionReconnectAttempts: 0
     readonly property int maximumSessionReconnectAttempts: 8
+    property int streamPollFailureAttempts: 0
+    readonly property int maximumStreamPollFailureAttempts: 8
     property bool sessionRecoveryPending: false
+    property bool sessionRecoveryAwaitingAuth: false
     property string recoverySessionId: ""
     property string recoveryDiscoveryRequestId: ""
     property int resumePollAttempts: 0
@@ -306,6 +646,8 @@ QtObject {
     property string providersRequestId: ""
     property string authSessionRequestId: ""
     property string activeSessionRequestId: ""
+    property string coreSessionRestoreId: ""
+    property string sessionStopIntentId: ""
     property string remoteSessionDiscoveryRequestId: ""
     property string remoteSessionsRequestId: ""
     property string sessionClaimRequestId: ""
@@ -434,14 +776,21 @@ QtObject {
     readonly property int streamerRecoveryCount: streamerRestartRecoveryCount
         + Number(streamer && streamer.deviceRecoveryCount || 0)
     readonly property string sessionPersistenceMessage: {
+        if (sessionPersistence === "local-file")
+            return qsTr("Your session tokens are saved unencrypted on disk because the OS keychain is unavailable. Anyone who can read this file can access your account.")
         if (sessionPersistence === "unavailable")
-            return qsTr("A saved NVIDIA session could not be opened. Sign in once more to store it on this PC.")
+            return qsTr("Your saved session could not be restored. Unlock your OS keychain and restart OpenNOW, or sign in again.")
         if (sessionPersistence === "memory-only")
             return qsTr("This session is memory-only and will not last after you quit.")
+        if (sessionPersistence === "migration-pending")
+            return qsTr("Secure account migration is pending. Unlock your system credential store and restart OpenNOW.")
+        if (authWarnings.length > 0)
+            return qsTr("Account credential cleanup is pending. Your saved data has been retained for recovery.")
         return ""
     }
     readonly property bool streamBusy: streamCreateRequestId !== "" || streamStopRequestId !== ""
-        || remoteSessionsRequestId !== "" || sessionClaimRequestId !== ""
+        || remoteSessionsRequestId !== "" || sessionClaimRequestId !== "" || launchInspectRequestId !== ""
+        || queueSelector.opened || queueLaunchWaitingForSubscription
 
     signal fullscreenToggleRequested()
     signal pointerLockToggleRequested()
@@ -491,8 +840,8 @@ QtObject {
         : qsTr("Uses the system default microphone. Open microphone sends audio continuously during supported sessions. Changes apply to the next session.")
 
     property Timer devicePollTimer: Timer {
-        interval: root.authChallenge ? Math.max(1000, Number(root.authChallenge.intervalSeconds || 5) * 1000) : 5000
-        repeat: true
+        interval: 5000
+        repeat: false
         running: false
         onTriggered: root.pollDeviceLogin()
     }
@@ -576,7 +925,15 @@ QtObject {
         refreshSettings()
         providersRequestId = CoreClient.request("auth.providers.list", {}, 25000)
         authSessionRequestId = CoreClient.request("auth.session.get", {})
-        activeSessionRequestId = CoreClient.request("session.active.get", {})
+        refreshSavedAccounts()
+        coreSessionRestoreId = activeSession && activeSession.ownerScope
+            ? String(activeSession.sessionId || "") : ""
+        if (coreSessionRestoreId !== "") {
+            streamPollTimer.stop()
+            streamPollFailureAttempts = 0
+        } else {
+            activeSessionRequestId = CoreClient.request("session.active.get", {})
+        }
         ensureNativeRuntimeReady()
         updaterStateRequestId = CoreClient.request("updater.state.get", {})
         socialCapabilitiesRequestId = CoreClient.request("social.capabilities.get", {})
@@ -601,6 +958,7 @@ QtObject {
         if (!session)
             return ""
         const appId = String(session.appId || "")
+        if (appId === "") return ""
         const games = catalogGames || []
         for (let gameIndex = 0; gameIndex < games.length; ++gameIndex) {
             const game = games[gameIndex]
@@ -618,18 +976,16 @@ QtObject {
     function selectGameForSession(session) {
         if (!session)
             return
-        const title = sessionGameTitle(session)
-        if (!title) {
-            selectedGame = {title: qsTr("Your running game"), launchAppId: String(session.appId || "")}
-            return
-        }
+        const appId = String(session.appId || "")
         const games = catalogGames || []
         for (let index = 0; index < games.length; ++index) {
-            if (String(games[index].title || "") === title) {
-                selectedGame = games[index]
+            const variantIndex = (games[index].variants || []).findIndex(variant => String(variant.id) === appId)
+            if (appId !== "" && variantIndex >= 0) {
+                selectedGame = Object.assign({}, games[index], {selectedVariantIndex:variantIndex})
                 return
             }
         }
+        selectedGame = {title:sessionGameTitle(session) || qsTr("Your running game"), launchAppId:appId, variants:[], selectedVariantIndex:-1}
     }
 
     function resumeActiveSession() {
@@ -740,16 +1096,20 @@ QtObject {
         return settingsOwner.codecAvailable(codec)
     }
 
+    function codecDisabledByProfile(codec) {
+        return settingsOwner.codecDisabledByProfile(codec)
+    }
+
+    function codecsDisabledByProfile() {
+        return settingsOwner.codecsDisabledByProfile()
+    }
+
     function hdrDecoderAvailable() {
         return settingsOwner.hdrDecoderAvailable()
     }
 
-    function availableCodecValues() {
-        return settingsOwner.availableCodecValues()
-    }
-
-    function availableCodecLabels() {
-        return settingsOwner.availableCodecLabels()
+    function tenBitAllowedByMembership() {
+        return settingsOwner.tenBitAllowedByMembership()
     }
 
     function canonicalFpsValues() {
@@ -770,6 +1130,26 @@ QtObject {
 
     function unentitledFpsValues(resolution) {
         return settingsOwner.unentitledFpsValues(resolution)
+    }
+
+    function lockedFpsValues(resolution) {
+        return settingsOwner.lockedFpsValues(resolution)
+    }
+
+    function selectableFpsValues(resolution) {
+        return settingsOwner.selectableFpsValues(resolution)
+    }
+
+    function frameRateReason(value) {
+        return settingsOwner.frameRateReason(value)
+    }
+
+    function maxEntitledFps(resolution) {
+        return settingsOwner.maxEntitledFps(resolution)
+    }
+
+    function lockedFpsReason() {
+        return settingsOwner.lockedFpsReason()
     }
 
     function resolveEntitledFps(resolution, requested) {
@@ -828,20 +1208,61 @@ QtObject {
         return catalogOwner.reloadStoreForSession()
     }
 
+    function refreshSavedAccounts(invalidate) {
+        if (!ready || (accountsRequestId !== "" && !invalidate))
+            return
+        const previous = accountsRequestId
+        accountsRequestId = ""
+        if (previous !== "") CoreClient.cancel(previous)
+        accountsRequestId = CoreClient.request("auth.accounts.list", {})
+    }
+
+    function showSavedAccountSelection() {
+        if (!ready || authRestorePending || authSessionRequestId !== "" || accountsRequestId !== ""
+                || signedIn || addingAccount || authState !== "idle" || activeSession || streamBusy
+                || savedAccounts.length === 0)
+            return
+        if (AppController.route === "home" || AppController.route === "sign-in")
+            AppController.navigate("accounts")
+    }
+
     function refreshAccountServices() {
+        refreshSavedAccounts()
         if (!ready || !signedIn)
             return
         if (subscriptionRequestId === "")
             subscriptionRequestId = CoreClient.request("account.subscription.get", {}, 30000)
         if (regionsRequestId === "")
             regionsRequestId = CoreClient.request("network.regions.list", {}, 30000)
-        if (accountsRequestId === "")
-            accountsRequestId = CoreClient.request("auth.accounts.list", {})
         if (gameAccountsRequestId === "") {
             gameAccountsState = gameAccounts.length ? "refreshing" : "loading"
             gameAccountsRequestId = CoreClient.request("account.connections.list", {}, 30000)
         }
         refreshRemoteSessions()
+    }
+
+    function acceptPushInvalidation(payload) {
+        if (!ready || !signedIn)
+            return
+        if (Number(payload.generation || 0) !== Number(authGeneration))
+            return
+        switch (String(payload.kind || "")) {
+        case "library":
+            catalogOwner.refreshCatalog("")
+            break
+        case "favorites":
+            catalogOwner.refreshFavorites()
+            break
+        case "subscription":
+        case "linked-account":
+            refreshAccountServices()
+            break
+        case "platform-sync":
+            accountServicesOwner.pollSync()
+            break
+        default:
+            break
+        }
     }
 
     function refreshRegions() {
@@ -945,6 +1366,8 @@ QtObject {
         if (!ready || updaterBusy || updaterState.canCheck !== true)
             return
         updaterError = ""
+        autoDownloadAttempt = ""
+        autoDownloadAttemptCount = 0
         updaterCheckRequestId = CoreClient.request("updater.check", {
             channel: settings.updateChannel || "stable"
         }, 30000)
@@ -971,6 +1394,9 @@ QtObject {
     }
 
     function acceptUpdaterState(state) {
+        if (["failed", "rolled-back"].indexOf(state.status) >= 0 && state.message
+                && (state.status !== updaterState.status || state.message !== updaterState.message))
+            updaterFailureMessage = state.message
         if (state.status !== updaterState.status
                 || ["error", "failed", "rolled-back", "succeeded", "managed-pending", "reboot-required"].indexOf(state.status) >= 0)
             updaterError = ""
@@ -1009,12 +1435,19 @@ QtObject {
                 + ":" + String(settings.updateChannel || "stable")
             if (release !== autoDownloadAttempt) {
                 autoDownloadAttempt = release
+                autoDownloadAttemptCount = 0
+            }
+            if (autoDownloadAttemptCount < 3 && (autoDownloadAttemptCount === 0
+                    || Date.now() - autoDownloadAttemptMs >= 60000 * Math.pow(2, autoDownloadAttemptCount - 1))) {
+                autoDownloadAttemptCount += 1
+                autoDownloadAttemptMs = Date.now()
                 downloadUpdate()
                 return
             }
         }
         if (settings.autoCheckForUpdates === true && updaterState.canCheck === true
-                && (lastAutoUpdateCheckMs === 0 || Date.now() - lastAutoUpdateCheckMs >= 21600000)) {
+                && (lastAutoUpdateCheckMs === 0 || Date.now() - lastAutoUpdateCheckMs
+                    >= (updaterState.status === "error" ? 300000 : 21600000))) {
             lastAutoUpdateCheckMs = Date.now()
             checkForUpdates()
         }
@@ -1056,16 +1489,21 @@ QtObject {
     }
 
     function switchAccount(userId, pin) {
-        if (ready && accountSwitchRequestId === "")
+        cancelDeviceLogin()
+        if (ready && accountSwitchRequestId === "") {
+            accountMessage = ""
             accountSwitchRequestId = CoreClient.request("auth.accounts.switch", {
                 userId: userId,
                 pin: pin || ""
             }, 30000)
+        }
     }
 
     function removeAccount(userId) {
-        if (ready && accountRemoveRequestId === "")
+        if (ready && accountRemoveRequestId === "") {
+            accountMessage = ""
             accountRemoveRequestId = CoreClient.request("auth.accounts.remove", { userId: userId })
+        }
     }
 
     function openPin(mode, account) {
@@ -1144,6 +1582,9 @@ QtObject {
     }
 
     function acceptDirectLaunch(appId, title) {
+        const previous = directLookupRequestId
+        directLookupRequestId = ""
+        if (previous !== "") CoreClient.cancel(previous)
         pendingDirectLaunch = {
             appId: String(appId || ""),
             title: String(title || "").trim()
@@ -1154,15 +1595,12 @@ QtObject {
     function gameMatchesDirectLaunch(game, request) {
         const requestedId = String(request.appId || "")
         if (requestedId !== "") {
-            if (String(game.launchAppId || "") === requestedId
-                    || String(game.appId || "") === requestedId
-                    || String(game.id || "") === requestedId)
-                return true
             const variants = game.variants || []
             for (let index = 0; index < variants.length; ++index) {
                 if (String(variants[index].id || "") === requestedId)
                     return true
             }
+            return false
         }
         return request.title !== ""
             && String(game.title || "").toLocaleLowerCase() === request.title.toLocaleLowerCase()
@@ -1174,16 +1612,26 @@ QtObject {
         if (Object.keys(settings).length === 0 || onboardingRequired
                 || onboardingSaving || onboardingReplaying || onboardingError !== "")
             return
+        if (/^[0-9]+$/.test(pendingDirectLaunch.appId)) {
+            if (!signedIn) { AppController.navigate("sign-in"); return }
+            if (ready && directLookupRequestId === "")
+                directLookupRequestId = CoreClient.request("catalog.game.get", {variantId:pendingDirectLaunch.appId}, 30000)
+            return
+        }
         if (catalogState !== "ready") {
-            if (ready && catalogRequestId === "")
-                refreshCatalog(pendingDirectLaunch.title)
+            catalogOwner.ensureCatalog(pendingDirectLaunch.title)
             return
         }
         let match = null
         for (let index = 0; index < catalogGames.length; ++index) {
             if (gameMatchesDirectLaunch(catalogGames[index], pendingDirectLaunch)) {
+                if (match) {
+                    lastError = qsTr("More than one game matches this title. Choose a game and store version from your library.")
+                    pendingDirectLaunch = null
+                    AppController.navigate("library")
+                    return
+                }
                 match = catalogGames[index]
-                break
             }
         }
         if (!match) {
@@ -1205,27 +1653,63 @@ QtObject {
         if (!selectedGame)
             return ""
         const variants = selectedGame.variants || []
-        const index = Math.max(0, Number(selectedGame.selectedVariantIndex || 0))
-        const variantId = variants.length > index ? String(variants[index].id || "") : ""
-        if (/^\d+$/.test(variantId))
+        const index = Number(selectedGame.selectedVariantIndex || 0)
+        const variantId = index >= 0 && variants.length > index ? String(variants[index].id || "") : ""
+        if (/^\d+$/.test(variantId) && Number(variantId) > 0 && Number(variantId) <= 2147483647)
             return variantId
-        const launchId = String(selectedGame.launchAppId || "")
-        return /^\d+$/.test(launchId) ? launchId : ""
+        return ""
     }
 
-    function selectedGameMembershipError() {
-        const requiredTier = String(selectedGame.membershipTierLabel || "").trim()
-        if (requiredTier === "" || /^free(?: tier|-tier)?$/i.test(requiredTier))
-            return ""
-        const accountTier = String((subscription && subscription.membershipTier) || "").trim()
-        if (accountTier === "") {
-            if (subscriptionRequestId === "")
-                subscriptionRequestId = CoreClient.request("account.subscription.get", {}, 30000)
-            return qsTr("Membership details unavailable. Please try again.")
+    readonly property bool queueSelectorFreeTier: signedIn && queueSelector.freeTier
+    property bool queueLaunchWaitingForSubscription: false
+    readonly property bool queueLaunchIntentCurrent: launchIntentCurrent()
+    onQueueLaunchIntentCurrentChanged: {
+        if (!queueLaunchIntentCurrent) queueLaunchWaitingForSubscription = false
+    }
+    property QueueSelectorState queueSelector: QueueSelectorState {
+        coreClient: CoreClient
+        authSession: root.authSession
+        subscription: root.subscription
+        eligible: root.ready && root.desktopUiActive && root.queueSelectorFreeTier
+            && root.settings.hideQueueSelector !== true && !root.activeSession
+        launchValid: root.queueLaunchIntentCurrent
+        onSelected: location => {
+            if (!root.launchIntentCurrent()) return
+            if (location) root.pendingLaunchParams = Object.assign({}, root.pendingLaunchParams, {
+                zone: location.zoneId, streamingBaseUrl: location.streamingBaseUrl
+            })
+            root.discoverPendingLaunch()
         }
-        if (/^free(?: tier|-tier)?$/i.test(accountTier))
-            return qsTr("This game requires a paid GeForce NOW membership.")
-        return ""
+        onDismissed: {
+            root.queueLaunchWaitingForSubscription = false
+            root.pendingLaunchParams = null
+            root.streamState = "idle"
+            root.streamMessage = ""
+        }
+    }
+    onSubscriptionRequestIdChanged: {
+        if (subscriptionRequestId === "" && queueLaunchWaitingForSubscription) {
+            queueLaunchWaitingForSubscription = false
+            Qt.callLater(root.continueInspectedLaunch)
+        }
+    }
+
+    function continueInspectedLaunch() {
+        if (!launchIntentCurrent()) return
+        if (desktopUiActive && subscriptionRequestId !== "") {
+            queueLaunchWaitingForSubscription = true
+            return
+        }
+        if (pendingLaunchParams.queueSelectorHandled === true
+                || !queueSelector.begin(pendingLaunchParams.title)) discoverPendingLaunch()
+    }
+
+    function discoverPendingLaunch() {
+        if (!launchIntentCurrent() || remoteSessionsRequestId !== "") return
+        pendingLaunchParams = Object.assign({}, pendingLaunchParams, {queueSelectorHandled: true})
+        streamState = "checking"
+        remoteSessionsRequestId = CoreClient.request("session.remote.list", pendingLaunchParams, 30000)
+        AppController.navigate("inserting")
     }
 
     function launchSelectedGame(directConsoleMode) {
@@ -1242,14 +1726,6 @@ QtObject {
         }
         if (!ready || streamBusy || onboardingReplaying)
             return
-        const membershipError = selectedGameMembershipError()
-        if (membershipError !== "") {
-            streamState = "error"
-            streamMessage = membershipError
-            lastError = membershipError
-            AppController.navigate("inserting")
-            return
-        }
         streamerRestartAttempts = 0
         streamerRecoveryExhausted = false
         sessionReconnectAttempts = 0
@@ -1262,13 +1738,23 @@ QtObject {
         const selectedVariant = variants.length > selectedVariantIndex ? variants[selectedVariantIndex] : null
         const params = {
             appId: appId,
+            catalogAppId: String(selectedGame.id),
+            scope: catalogOwner.authScope,
+            variantId: appId,
+            selectionIdentity: catalogOwner.selectedIdentity,
+            authGeneration: authGeneration,
+            actionGeneration: catalogOwner.actionGeneration,
+            requestContextKey: catalogOwner.requestContextKey,
             title: selectedGame.title || "GeForce NOW game",
             supportsInGameSettingsPersistence: Boolean(selectedVariant && selectedVariant.supportsInGameSettingsPersistence),
             accountLinked: Boolean(selectedVariant && selectedVariant.inLibrary),
             appLaunchMode: settings.steamBigPictureMode === true
                 ? "gamepadFriendly" : "default"
         }
-        const configuredRegion = String(settings.region || "")
+        if (storeLaunchTarget && String(storeLaunchTarget.appId) === String(selectedGame.id)
+                && String(storeLaunchTarget.variantId) === appId)
+            params.storeLaunch = true
+        const configuredRegion = selectedRegion
         for (let index = 0; index < regions.length; ++index) {
             const region = regions[index]
             if (configuredRegion === region.name || configuredRegion === region.url) {
@@ -1284,8 +1770,7 @@ QtObject {
         streamState = "checking"
         streamMessage = qsTr("Looking for your game on GeForce NOW…")
         lastError = qsTr("")
-        remoteSessionsRequestId = CoreClient.request("session.remote.list", params, 30000)
-        AppController.navigate("inserting")
+        inspectLaunch("discover")
     }
 
     function checkLaunchSessions() {
@@ -1294,7 +1779,7 @@ QtObject {
         streamState = "checking"
         streamMessage = qsTr("Looking for your game on GeForce NOW…")
         lastError = qsTr("")
-        remoteSessionsRequestId = CoreClient.request("session.remote.list", pendingLaunchParams, 30000)
+        inspectLaunch("discover")
     }
 
     function retrySessionLaunch() {
@@ -1334,8 +1819,7 @@ QtObject {
             lastError = streamMessage
             return
         }
-        streamCreateRequestId = CoreClient.request("session.create",
-            Object.assign({}, pendingLaunchParams, {runtimeCapabilities: nativeRuntimeCapabilities}), 35000)
+        inspectLaunch("create")
     }
 
     function resolveSessionConflict(choice) {
@@ -1343,6 +1827,7 @@ QtObject {
             return
         AppController.showOverlay("")
         if (choice === "cancel") {
+            invalidateLaunchInspection()
             pendingLaunchParams = null
             conflictSession = null
             conflictSessionNeedsRefresh = false
@@ -1380,14 +1865,7 @@ QtObject {
                 createPendingSession()
                 return
             }
-            forceNewAfterStop = true
-            streamState = "stopping"
-            streamMessage = qsTr("Closing the previous cloud session…")
-            streamStopRequestId = CoreClient.request("session.stop", {
-                sessionId: conflictSession.sessionId,
-                streamingBaseUrl: conflictSession.streamingBaseUrl,
-                serverIp: conflictSession.serverIp || ""
-            }, 35000)
+            inspectLaunch("stop")
         }
     }
 
@@ -1451,12 +1929,29 @@ QtObject {
     }
 
     function acceptStreamingSession(session) {
+        if (session && Number(session.status) === 7) {
+            finishRemoteSession(session.termination || {source: "cloudmatch-session-status", status: 7, sessionId: session.sessionId,
+                                resumable: false})
+            return
+        }
         const previousSession = activeSession
-        activeSession = normalizedStreamingSession(session)
+        const nextSession = normalizedStreamingSession(session)
+        if (nextSession && previousSession && nextSession.sessionId === previousSession.sessionId
+                && (nextSession.keyboardLayout === undefined || nextSession.keyboardLayout === null)
+                && previousSession.keyboardLayout !== undefined && previousSession.keyboardLayout !== null)
+            nextSession.keyboardLayout = previousSession.keyboardLayout
+        activeSession = nextSession
         if (!activeSession || !previousSession || previousSession.sessionId !== activeSession.sessionId) {
+            const pollId = streamPollRequestId
+            streamPollRequestId = ""
+            coreSessionRestoreId = ""
+            sessionStopIntentId = ""
+            if (pollId !== "") CoreClient.cancel(pollId)
             streamerRestartTimer.stop()
             streamerRestartAttempts = 0
             sessionReconnectAttempts = 0
+            sessionRecoveryAwaitingAuth = false
+            streamPollFailureAttempts = 0
             streamerRecoveryExhausted = false
         }
         if (!activeSession) {
@@ -1498,12 +1993,9 @@ QtObject {
             streamMessage = qsTr("GeForce NOW could not prepare this session.")
             streamPollTimer.stop()
         } else {
-            const position = Number(activeSession.queuePosition || 0)
             streamMessage = activeSession.resumePending
                 ? qsTr("Reconnecting to your running game. You don't need to start again.")
-                : position > 0
-                ? qsTr("Queue position %1").arg(position)
-                : qsTr("Preparing your cloud gaming seat…")
+                : sessionSetupProgress.title + "\n" + sessionSetupProgress.detail
             streamPollTimer.restart()
         }
         syncDiscordPresence()
@@ -1543,8 +2035,9 @@ QtObject {
     }
 
     function startNativeStreamer() {
-        if (!ready || !activeSession || sessionRecoveryPending || activeSession.resumePending
-                || streamerStopRequestId !== "" || streamerStartRequestId !== ""
+        if (!ready || !activeSession || sessionRecoveryPending || sessionRecoveryAwaitingAuth || activeSession.resumePending
+                || coreSessionRestoreId !== "" || sessionStopIntentId === String(activeSession.sessionId)
+                || streamStopRequestId !== "" || streamerStopRequestId !== "" || streamerStartRequestId !== ""
                 || streamerPrepareRequestId !== "" || sessionClaimRequestId !== ""
                 || streamerRestartTimer.running || streamerRecoveryExhausted)
             return
@@ -1564,6 +2057,7 @@ QtObject {
             recordingStopCount: 0,
             queueDropCount: 0
         }
+        streamColorFormat = null
         microphoneRequestId = ""
         sessionMicrophoneMode = "disabled"
         streamInputStateKnown = false
@@ -1588,11 +2082,17 @@ QtObject {
         streamerRestartTimer.stop()
         streamerRestartAttempts = 0
         sessionReconnectAttempts = 0
+        streamPollFailureAttempts = 0
+        sessionStopIntentId = ""
         streamerRecoveryExhausted = false
         recoverStreamingSession(streamMessage)
     }
 
     function acceptStreamerSnapshot(snapshot) {
+        if (snapshot && isRemoteSessionTermination(snapshot.termination)) {
+            finishRemoteSession(snapshot.termination)
+            return
+        }
         // One failure produces both error and stopped, plus late input replies.
         // Count it once and preserve the original, actionable error message.
         const wasTerminal = streamer && (streamer.status === "error" || streamer.status === "stopped")
@@ -1648,6 +2148,14 @@ QtObject {
             ? qsTr("Native media startup failed") : qsTr("The native media runtime stopped unexpectedly"))
         if (!activeSession)
             return
+        if (streamer.errorCode === "missing-video-peer"
+                || streamer.errorCode === "nvst-legacy-transport-unsupported") {
+            cancelSessionRecovery()
+            streamerRecoveryExhausted = true
+            streamState = "error"
+            lastError = streamMessage
+            return
+        }
         if (sessionRecoveryPending || streamerRestartTimer.running)
             return
         scheduleSessionRecovery(streamMessage)
@@ -1655,10 +2163,20 @@ QtObject {
 
     function recoverStreamingSession(reason) {
         if (!activeSession || sessionClaimRequestId !== "" || recoveryDiscoveryRequestId !== ""
-                || streamerStopRequestId !== "")
+                || streamerStopRequestId !== "" || sessionStopIntentId === String(activeSession.sessionId))
             return
+        if (!sessionOwnerSignedIn()) {
+            sessionRecoveryAwaitingAuth = true
+            streamerRestartTimer.stop()
+            return
+        }
+        sessionRecoveryAwaitingAuth = false
         if (!ready) {
             streamerRestartTimer.restart()
+            return
+        }
+        if (coreSessionRestoreId !== "") {
+            pollStreamingSession()
             return
         }
         if (sessionReconnectAttempts >= maximumSessionReconnectAttempts) {
@@ -1676,10 +2194,11 @@ QtObject {
         streamState = "reconnecting"
         streamMessage = qsTr("Reconnecting to the GeForce NOW session…")
         streamPollTimer.stop()
-        for (const id of [streamerPrepareRequestId, streamPollRequestId])
-            if (id !== "") CoreClient.cancel(id)
+        const pendingRequests = [streamerPrepareRequestId, streamPollRequestId]
         streamerPrepareRequestId = ""
         streamPollRequestId = ""
+        for (const id of pendingRequests)
+            if (id !== "") CoreClient.cancel(id)
         // Stop/reap the previous native connection before claiming fresh keys.
         // This is NOT session.stop: the cloud game must remain alive.
         if (NativeStreamRuntime.running && streamer && streamer.status !== "stopped") {
@@ -1694,7 +2213,8 @@ QtObject {
     function scheduleSessionRecovery(reason) {
         sessionRecoveryPending = false
         streamMessage = reason || qsTr("Connection lost. Waiting to reconnect…")
-        if (!activeSession || streamStopRequestId !== "") return
+        if (!activeSession || streamStopRequestId !== ""
+                || sessionStopIntentId === String(activeSession.sessionId)) return
         if (sessionReconnectAttempts >= maximumSessionReconnectAttempts) {
             streamerRecoveryExhausted = true
             streamerRestartTimer.stop()
@@ -1709,9 +2229,15 @@ QtObject {
     function discoverRecoverySession() {
         if (!sessionRecoveryPending || !activeSession
                 || String(activeSession.sessionId) !== recoverySessionId) return
-        recoveryDiscoveryRequestId = CoreClient.request("session.remote.list", {
+        if (!sessionOwnerSignedIn()) {
+            sessionRecoveryPending = false
+            sessionRecoveryAwaitingAuth = true
+            return
+        }
+        recoveryDiscoveryRequestId = CoreClient.request("session.poll", {
             sessionId: recoverySessionId,
-            streamingBaseUrl: activeSession.streamingBaseUrl
+            streamingBaseUrl: activeSession.streamingBaseUrl,
+            recoveryMode: true
         }, 30000)
         if (recoveryDiscoveryRequestId === "") scheduleSessionRecovery(qsTr("Waiting for the connection…"))
     }
@@ -1719,8 +2245,16 @@ QtObject {
     function acceptRecoverySessions(result) {
         if (!sessionRecoveryPending || !activeSession
                 || String(activeSession.sessionId) !== recoverySessionId) return
-        const existing = (result.sessions || []).find(session => String(session.sessionId) === recoverySessionId)
-        if (!existing) {
+        if (isRemoteSessionTermination(result.termination)) {
+            finishRemoteSession(result.termination)
+            return
+        }
+        const existing = result.session
+        if (existing && String(existing.sessionId) === recoverySessionId && Number(existing.status) === 7) {
+            acceptStreamingSession(existing)
+            return
+        }
+        if (!existing || String(existing.sessionId) !== recoverySessionId) {
             scheduleSessionRecovery(qsTr("The previous session is not available yet. Retrying…"))
             return
         }
@@ -1740,12 +2274,37 @@ QtObject {
         recoveryDiscoveryRequestId = ""
         sessionClaimRequestId = ""
         sessionRecoveryPending = false
+        sessionRecoveryAwaitingAuth = false
         sessionClaimIsRecovery = false
         recoverySessionId = ""
         resumePollAttempts = 0
         resumePollDeadlineMs = 0
         for (const id of requestIds)
             if (id !== "") CoreClient.cancel(id)
+    }
+
+    function isRemoteSessionTermination(termination) {
+        return termination && termination.resumable === false
+            && ((termination.source === "cloudmatch-session-status" && Number(termination.status) === 7)
+                || (termination.source === "cloudmatch-http" && Number(termination.httpStatus) === 404))
+    }
+
+    function finishRemoteSession(termination) {
+        if (!isRemoteSessionTermination(termination))
+            return
+        if (termination.sessionId && activeSession
+                && String(termination.sessionId) !== String(activeSession.sessionId))
+            return
+        const pendingRequests = [streamerPrepareRequestId, streamPollRequestId]
+        streamerPrepareRequestId = ""
+        streamPollRequestId = ""
+        for (const id of pendingRequests)
+            if (id !== "") CoreClient.cancel(id)
+        acceptStreamingSession(null)
+        if (AppController.route === "stream" || AppController.route === "inserting") {
+            AppController.showOverlay("")
+            AppController.navigateFromLastPrimary("game-detail")
+        }
     }
 
     function artworkUrl(sourceUrl) {
@@ -1909,15 +2468,15 @@ QtObject {
     function streamShortcutBindings() {
         return {
             "guide": ["Ctrl+G"],
-            "toggle-pointer-lock": [String(settings.shortcutTogglePointerLock || "F8")],
-            "toggle-fullscreen": [String(settings.shortcutToggleFullscreen || "F11")],
-            "stop-stream": [String(settings.shortcutStopStream || "Ctrl+Shift+Q")],
-            "toggle-anti-afk": [String(settings.shortcutToggleAntiAfk || "Ctrl+Shift+K")],
+            "toggle-pointer-lock": [String(settings.shortcutTogglePointerLock ?? "F8")],
+            "toggle-fullscreen": [String(settings.shortcutToggleFullscreen ?? "F11")],
+            "stop-stream": [String(settings.shortcutStopStream ?? "Ctrl+Shift+Q")],
+            "toggle-anti-afk": [String(settings.shortcutToggleAntiAfk ?? "Ctrl+Shift+K")],
             "toggle-microphone": microphoneToggleAvailable
-                ? [String(settings.shortcutToggleMicrophone || "Ctrl+Shift+M")] : [],
-            "screenshot": [String(settings.shortcutScreenshot || "Ctrl+F11")],
-            "toggle-recording": [String(settings.shortcutToggleRecording || "F12")],
-            "save-clip": [String(settings.shortcutSaveClip || "Ctrl+F12")]
+                ? [String(settings.shortcutToggleMicrophone ?? "Ctrl+Shift+M")] : [],
+            "screenshot": [String(settings.shortcutScreenshot ?? "Ctrl+F11")],
+            "toggle-recording": [String(settings.shortcutToggleRecording ?? "F12")],
+            "save-clip": [String(settings.shortcutSaveClip ?? "Ctrl+F12")]
         }
     }
 
@@ -2064,6 +2623,21 @@ QtObject {
     function pollStreamingSession() {
         if (!ready || !activeSession || streamPollRequestId !== "" || streamStopRequestId !== "")
             return
+        if (sessionStopIntentId === String(activeSession.sessionId) && coreSessionRestoreId === "")
+            return
+        if (!(activeSession.resumePending && coreSessionRestoreId === "")
+                && streamPollFailureAttempts > maximumStreamPollFailureAttempts) {
+            streamPollTimer.stop()
+            return
+        }
+        if (coreSessionRestoreId !== "") {
+            if (authSessionRequestId !== "") return
+            streamPollRequestId = CoreClient.request("session.active.get", {
+                sessionId: coreSessionRestoreId,
+                ownerScope: activeSession.ownerScope
+            }, 35000)
+            return
+        }
         if (activeSession.resumePending && (++resumePollAttempts > 60
                 || (resumePollDeadlineMs > 0 && Date.now() >= resumePollDeadlineMs))) {
             streamPollTimer.stop()
@@ -2076,11 +2650,41 @@ QtObject {
         }, 35000)
     }
 
+    function handleStreamPollFailure(code, message) {
+        if (code === "session_owner_authentication_required") {
+            streamPollTimer.stop()
+            streamMessage = message
+            lastError = message
+            return
+        }
+        if (activeSession && activeSession.resumePending && coreSessionRestoreId === "") {
+            streamMessage = qsTr("Waiting for the resumed session…")
+            streamPollTimer.restart()
+            return
+        }
+        streamPollFailureAttempts += 1
+        const retry = activeSession && streamPollFailureAttempts <= maximumStreamPollFailureAttempts
+        if (coreSessionRestoreId === "" || !streamer || streamer.status !== "streaming")
+            streamState = retry ? "reconnecting" : "error"
+        streamMessage = retry ? qsTr("Connection interrupted. Retrying…") : message
+        if (retry) {
+            streamPollTimer.restart()
+        } else {
+            streamPollTimer.stop()
+            lastError = message
+        }
+    }
+
     function stopStreamingSession() {
+        sessionStopIntentId = activeSession ? String(activeSession.sessionId) : ""
+        if (coreSessionRestoreId !== "") streamPollFailureAttempts = 0
+        invalidateLaunchInspection()
         const discoveryRequestId = remoteSessionsRequestId
         const createRequestId = streamCreateRequestId
+        const prepareRequestId = streamerPrepareRequestId
         remoteSessionsRequestId = ""
         streamCreateRequestId = ""
+        streamerPrepareRequestId = ""
         pendingLaunchParams = null
         conflictSession = null
         conflictSessionNeedsRefresh = false
@@ -2090,6 +2694,8 @@ QtObject {
             CoreClient.cancel(discoveryRequestId)
         if (createRequestId !== "")
             CoreClient.cancel(createRequestId)
+        if (prepareRequestId !== "")
+            CoreClient.cancel(prepareRequestId)
         cancelSessionRecovery()
         if (activeSession && streamStartedAtMs > 0) {
             const snapshot = streamer || ({})
@@ -2121,8 +2727,9 @@ QtObject {
         streamPollTimer.stop()
         stopNativeStreamer("User stopped the session")
         if (streamPollRequestId !== "") {
-            CoreClient.cancel(streamPollRequestId)
+            const pollId = streamPollRequestId
             streamPollRequestId = ""
+            CoreClient.cancel(pollId)
         }
         if (!activeSession) {
             streamState = "idle"
@@ -2131,6 +2738,10 @@ QtObject {
         }
         if (!ready || streamStopRequestId !== "")
             return
+        if (coreSessionRestoreId !== "") {
+            pollStreamingSession()
+            return
+        }
         streamState = "stopping"
         streamMessage = qsTr("Closing the remote session…")
         streamStopRequestId = CoreClient.request("session.stop", {
@@ -2139,13 +2750,27 @@ QtObject {
         }, 35000)
     }
 
+    function beginAddAccount() {
+        cancelDeviceLogin()
+        addingAccount = true
+        authState = "idle"
+        authMessage = ""
+        AppController.navigate("sign-in")
+    }
+
     function startDeviceLogin(providerIdpId, staySignedIn) {
         if (!ready || deviceStartRequestId !== "")
             return
+        if (!providerIdpId || !providers.some(provider => provider.idpId === providerIdpId)) {
+            authState = "error"
+            authMessage = qsTr("Select an available provider before signing in.")
+            return
+        }
+        selectedProviderIdpId = providerIdpId
         pendingStaySignedIn = staySignedIn !== false
         cancelDeviceLogin()
         lastError = qsTr("")
-        authMessage = qsTr("Contacting NVIDIA…")
+        authMessage = qsTr("Contacting provider…")
         authState = "starting"
         const params = providerIdpId ? { providerIdpId: providerIdpId } : {}
         deviceStartRequestId = CoreClient.request("auth.device.start", params, 30000)
@@ -2155,13 +2780,22 @@ QtObject {
         if (!ready || !authChallenge || devicePollRequestId !== "")
             return
         devicePollRequestId = CoreClient.request("auth.device.poll", {
-            attemptId: authChallenge.attemptId,
-            deviceCode: authChallenge.deviceCode
+            attemptId: authChallenge.attemptId
         }, 30000)
     }
 
     function cancelDeviceLogin() {
         devicePollTimer.stop()
+        if (deviceStartRequestId !== "") {
+            CoreClient.cancel(deviceStartRequestId)
+            deviceStartRequestId = ""
+        }
+        if (deviceCompleteRequestId !== "") {
+            CoreClient.cancel(deviceCompleteRequestId)
+            deviceCompleteRequestId = ""
+            if (ready)
+                authSessionRequestId = CoreClient.request("auth.session.get", {})
+        }
         if (devicePollRequestId !== "") {
             CoreClient.cancel(devicePollRequestId)
             devicePollRequestId = ""
@@ -2169,18 +2803,114 @@ QtObject {
         if (authChallenge && ready)
             CoreClient.request("auth.device.cancel", { attemptId: authChallenge.attemptId })
         authChallenge = null
-        if (!signedIn)
+        if (!signedIn || addingAccount) {
             authState = "idle"
+            authMessage = ""
+        }
     }
 
     function logout() {
+        cancelDeviceLogin()
         if (ready && logoutRequestId === "")
             logoutRequestId = CoreClient.request("auth.logout", {})
     }
 
     function logoutAll() {
-        if (ready && logoutAllRequestId === "")
+        cancelDeviceLogin()
+        if (ready && logoutAllRequestId === "") {
+            accountMessage = ""
             logoutAllRequestId = CoreClient.request("auth.accounts.logoutAll", {})
+        }
+    }
+
+    function acceptAuthEnvelope(payload) {
+        const generation = payload.generation === undefined ? authGeneration : Number(payload.generation)
+        if (generation < authGeneration)
+            return false
+        const next = payload.session || null
+        const changed = generation !== authGeneration
+            || String(authSession && authSession.user ? authSession.user.userId : "") !== String(next && next.user ? next.user.userId : "")
+            || String(authSession && authSession.provider ? authSession.provider.idpId : "") !== String(next && next.provider ? next.provider.idpId : "")
+        const keepPreparedOwner = activeSession && activeSession.ownerScope && next
+            && Number(activeSession.ownerScope.generation) === generation
+            && String(activeSession.ownerScope.userId) === String(next.user.userId)
+            && String(activeSession.ownerScope.providerIdpId) === String(next.provider.idpId)
+        const interruptedRecovery = changed && activeSession
+            && (recoveryDiscoveryRequestId !== ""
+                || (sessionClaimIsRecovery && sessionClaimRequestId !== "")
+                || (streamerPrepareRequestId !== "" && !keepPreparedOwner))
+        if (changed) {
+            if (interruptedRecovery)
+                cancelSessionRecovery()
+            accountServicesOwner.invalidateAccount()
+            for (const key of ["remoteSessionsRequestId", "remoteSessionDiscoveryRequestId", "sessionClaimRequestId", "streamCreateRequestId", "streamerPrepareRequestId"]) {
+                if (key === "streamerPrepareRequestId" && keepPreparedOwner) continue
+                const requestId = root[key]
+                root[key] = ""
+                if (requestId !== "") CoreClient.cancel(requestId)
+            }
+            remoteSessions = []
+            pendingLaunchParams = null
+            conflictSession = null
+            invalidateStoreLaunch()
+        }
+        authGeneration = generation
+        authSession = payload.session || null
+        sessionPersistence = payload.persistence || "none"
+        authWarnings = payload.warnings || []
+        if (interruptedRecovery)
+            sessionRecoveryAwaitingAuth = true
+        if (changed && coreSessionRestoreId === "" && sessionRecoveryAwaitingAuth && sessionOwnerSignedIn()) {
+            sessionRecoveryAwaitingAuth = false
+            scheduleSessionRecovery(streamMessage)
+        }
+        if (changed && coreSessionRestoreId !== "" && activeSession && activeSession.ownerScope && next
+                && String(activeSession.ownerScope.userId) === String(next.user.userId)
+                && String(activeSession.ownerScope.providerIdpId) === String(next.provider.idpId)) {
+            streamPollFailureAttempts = 0
+            Qt.callLater(root.pollStreamingSession)
+        }
+        if (changed) {
+            Qt.callLater(root.reloadCatalogForSession)
+            if (next) Qt.callLater(root.refreshAccountServices)
+        }
+        return true
+    }
+
+    function matchesAuthScope(scope) {
+        return !scope || (Number(scope.generation) === authGeneration && authSession
+            && String(scope.userId) === String(authSession.user.userId)
+            && String(scope.providerIdpId) === String(authSession.provider.idpId))
+    }
+
+    function sessionOwnerSignedIn() {
+        const owner = activeSession && activeSession.ownerScope
+        return !owner || Boolean(authSession
+            && String(owner.userId) === String(authSession.user.userId)
+            && String(owner.providerIdpId) === String(authSession.provider.idpId))
+    }
+
+    function acceptsSessionScope(scope) {
+        if (matchesAuthScope(scope)) return true
+        if (authSession && Number(scope.generation) < authGeneration
+                && String(scope.userId) === String(authSession.user.userId)
+                && String(scope.providerIdpId) === String(authSession.provider.idpId)) return false
+        const owner = activeSession && activeSession.ownerScope
+        return Boolean(owner && Number(owner.generation) === Number(scope.generation)
+            && String(owner.userId) === String(scope.userId)
+            && String(owner.providerIdpId) === String(scope.providerIdpId))
+    }
+
+    function ownedSessionTermination(result) {
+        const owner = activeSession && activeSession.ownerScope
+        const scope = result && result.scope
+        if (!owner || !scope || String(owner.userId) !== String(scope.userId)
+                || String(owner.providerIdpId) !== String(scope.providerIdpId)) return null
+        const session = result.session
+        const termination = result.termination || (session && Number(session.status) === 7
+            ? (session.termination || {source:"cloudmatch-session-status",status:7,sessionId:session.sessionId,resumable:false}) : null)
+        return isRemoteSessionTermination(termination) && termination.sessionId
+            && String(termination.sessionId) === String(activeSession.sessionId) ? termination : null
     }
 
     function requestConsoleSurface(enabled) {
@@ -2197,6 +2927,10 @@ QtObject {
 
     function resetSettings() {
         return settingsOwner.resetSettings()
+    }
+
+    function updateShortcuts(bindings) {
+        return settingsOwner.updateShortcuts(bindings)
     }
 
     function applyCoupledSettings(changes) {
@@ -2408,8 +3142,47 @@ QtObject {
         streamDropCounts = next
     }
 
+    function acceptStreamColorFormat(requested, actual, source, eventSessionId) {
+        const sessionId = String(activeSession && activeSession.sessionId || "")
+        if (!sessionId || !streamer || streamer.sessionId !== sessionId
+                || ["starting", "streaming"].indexOf(streamer.status) < 0
+                || streamerStopExpected || streamStopRequestId !== ""
+                || (eventSessionId && eventSessionId !== sessionId)) return
+        const supported = ["8bit_420", "8bit_444", "10bit_420", "10bit_444"]
+        if (supported.indexOf(requested) < 0 || supported.indexOf(actual) < 0
+                || ["decoder", "server"].indexOf(source) < 0) return
+        const requestedColor = source === "decoder" && supported.indexOf(streamRequestedColorQuality) >= 0
+            ? streamRequestedColorQuality : requested
+        streamColorFormat = {sessionId: sessionId, requestedColorQuality: requestedColor,
+            actualColorQuality: actual, source: source}
+        if (requestedColor !== actual && !streamColorNotice && !streamColorNoticeShown)
+            streamColorNotice = streamColorFormat
+    }
+
+    function observeNegotiatedColorFormat() {
+        if (streamColorProfileObserved) return
+        streamColorProfileObserved = true
+        const profile = activeSession && activeSession.negotiatedStreamProfile
+        if (!profile || !streamRequestedColorQuality) return
+        const requestedDepth = streamRequestedColorQuality.startsWith("10bit_") ? 10 : 8
+        const requestedChroma = streamRequestedColorQuality.endsWith("_444") ? 1 : 0
+        const depthChanged = profile.bitDepth !== requestedDepth
+        const chromaChanged = profile.chromaFormat !== requestedChroma
+        if ((!depthChanged && !chromaChanged)
+                || (depthChanged && profile.bitDepthSource !== "finalized")
+                || (chromaChanged && profile.chromaFormatSource !== "finalized")) return
+        acceptStreamColorFormat(streamRequestedColorQuality, profile.colorQuality, "server", "")
+    }
+
     function acceptNativeEvent(event) {
         const type = String(event && event.type || "")
+        if (event && event.event === "color-format-changed") {
+            if (type === "log" && event.source === "decoder"
+                    && typeof event.sessionId === "string" && event.sessionId !== "")
+                acceptStreamColorFormat(event.requestedColorQuality, event.actualColorQuality,
+                    event.source, event.sessionId)
+            return
+        }
         const fields = {}
         if (event.framesPerSecond !== undefined)
             fields.framesPerSecond = Number(event.framesPerSecond)
@@ -2418,7 +3191,7 @@ QtObject {
         if (event.peakBitrateMbps !== undefined)
             fields.peakBitrateMbps = Number(event.peakBitrateMbps)
         // Keep missing measurements unavailable instead of converting null to 0.
-        for (const key of ["pingMs", "jitterMs", "packetLossPercent", "decodeTimeMs", "latencyMs"]) {
+        for (const key of ["receiveBitrateMbps", "pingMs", "jitterMs", "packetLossPercent", "decodeTimeMs", "decoderResidenceMs", "latencyMs"]) {
             if (event[key] !== undefined)
                 fields[key] = event[key] === null || !Number.isFinite(Number(event[key]))
                     ? null : Number(event[key])
@@ -2441,6 +3214,8 @@ QtObject {
                     Date.now() - Number(streamer.sessionStartedAtMs || Date.now()))
             }
             fields.mediaBackend = String(event.backend || "")
+            if (!event.sessionId || event.sessionId === String(activeSession.sessionId))
+                observeNegotiatedColorFormat()
         } else if (event.event === "backend-fallback") {
             fields.backendFallbackCount = Number(streamer && streamer.backendFallbackCount || 0) + 1
         } else if (event.event === "decoder-error") {
@@ -2461,10 +3236,12 @@ QtObject {
         if (type === "status") {
             fields.status = event.status === "ready" ? "streaming" : String(event.status || "streaming")
             fields.message = String(event.message || streamMessage)
+            fields.termination = event.termination || null
         } else if (type === "error") {
             fields.status = "error"
             fields.message = String(event.message || qsTr("Native media runtime failed"))
             fields.errorCode = String(event.code || "native_stream_error")
+            fields.termination = event.termination || null
         } else if (type === "input-ready") {
             fields.inputReady = true
             fields.inputUnavailableReason = null
@@ -2528,6 +3305,9 @@ QtObject {
                 fields.fullscreenToggleCount = Number(streamer && streamer.fullscreenToggleCount || 0) + 1
         }
         updateStreamerFields(fields)
+        if (type === "telemetry" && Object.prototype.hasOwnProperty.call(event, "packetLossPercent")
+                && (!event.sessionId || String(event.sessionId) === connectionHealth.sessionId))
+            connectionHealth.acceptSample(event.packetLossPercent)
     }
 
     property Connections nativeRuntimeConnections: Connections {
@@ -2575,14 +3355,51 @@ QtObject {
     property Connections coreConnections: Connections {
         target: CoreClient
         function onStateChanged() {
-            if (CoreClient.state === "ready")
+            if (CoreClient.state === "ready") {
+                root.authGeneration = 0
                 root.initializeServices()
-            else if (CoreClient.state === "failed") {
-                root.lastError = CoreClient.lastError
-                root.authRestorePending = false
+            }
+            else {
+                root.invalidateStoreLaunch()
+                if (CoreClient.state === "failed") {
+                    root.lastError = CoreClient.lastError
+                    root.authRestorePending = false
+                }
             }
         }
         function onResponseReceived(requestId, result) {
+            if (settingsOwner.acceptResponse(requestId, result)) return
+            const ownedTermination = root.ownedSessionTermination(result)
+            if (ownedTermination) {
+                root.finishRemoteSession(ownedTermination)
+                return
+            }
+            const newerSameOwner = result.scope && Number(result.scope.generation) > root.authGeneration
+                && root.authSession && String(result.scope.userId) === String(root.authSession.user.userId)
+                && String(result.scope.providerIdpId) === String(root.authSession.provider.idpId)
+            if (newerSameOwner && root.authSessionRequestId === "")
+                root.authSessionRequestId = CoreClient.request("auth.session.get", {})
+            if (result.scope && !newerSameOwner && !root.matchesAuthScope(result.scope)
+                    && !(result.session !== undefined && root.acceptsSessionScope(result.scope))) {
+                if (Number(result.scope.generation) > root.authGeneration && root.authSessionRequestId === "")
+                    root.authSessionRequestId = CoreClient.request("auth.session.get", {})
+                if (requestId === root.streamPollRequestId) root.streamPollRequestId = ""
+                if (requestId === root.recoveryDiscoveryRequestId) {
+                    root.recoveryDiscoveryRequestId = ""
+                    root.scheduleSessionRecovery(root.streamMessage)
+                }
+                return
+            }
+            const authRequests = ["authSessionRequestId", "deviceCompleteRequestId", "logoutRequestId",
+                "logoutAllRequestId", "accountSwitchRequestId", "accountRemoveRequestId"]
+            for (let index = 0; index < authRequests.length; ++index) {
+                const propertyName = authRequests[index]
+                if (requestId === root[propertyName] && result.session !== undefined
+                        && !root.acceptAuthEnvelope(result)) {
+                    root[propertyName] = ""
+                    return
+                }
+            }
             if (onboardingOwner.acceptResponse(requestId, result)) {
                 return
             } else if (root.finishArtworkRequest(requestId, result, false)) {
@@ -2598,6 +3415,17 @@ QtObject {
             } else if (requestId === root.providersRequestId) {
                 root.providers = result.providers || []
                 root.providersRequestId = ""
+                if (root.selectedProviderIdpId === "" && result.defaultProviderIdpId)
+                    root.selectedProviderIdpId = result.defaultProviderIdpId
+                if (Number(result.generation || 0) > root.authGeneration && root.authSessionRequestId === "")
+                    root.authSessionRequestId = CoreClient.request("auth.session.get", {})
+                root.providerDiscoveryDegraded = Boolean(result.discovery && result.discovery.state === "degraded")
+                if (root.providerDiscoveryDegraded)
+                    root.scheduleProviderRetry(result.discovery.retryAfterMs)
+                else if (!root.providerDiscoveryDegraded) {
+                    root.providerRetryAttempts = 0
+                    root.providerRetryTimer.stop()
+                }
             } else if (requestId === root.authSessionRequestId) {
                 root.authSession = result.session || null
                 root.sessionPersistence = result.persistence || "none"
@@ -2614,7 +3442,10 @@ QtObject {
                     root.refreshRemoteSessions()
                 else
                     root.remoteSessions = []
+                if (root.coreSessionRestoreId !== "")
+                    root.pollStreamingSession()
                 root.resolveDirectLaunch()
+                root.showSavedAccountSelection()
             } else if (requestId === root.catalogRequestId) {
                 catalogOwner.acceptCatalog(result)
                 root.resolveDirectLaunch()
@@ -2627,6 +3458,7 @@ QtObject {
                 root.authState = "waiting"
                 root.authMessage = qsTr("Scan the QR code or enter %1").arg(result.userCode)
                 root.deviceStartRequestId = ""
+                root.devicePollTimer.interval = Math.max(1000, Number(result.intervalSeconds || 5) * 1000)
                 root.devicePollTimer.restart()
             } else if (requestId === root.devicePollRequestId) {
                 root.devicePollRequestId = ""
@@ -2641,11 +3473,13 @@ QtObject {
                     }, 30000)
                 } else if (status === "pending") {
                     root.authState = "waiting"
+                    root.devicePollTimer.interval = Math.max(1000, Number(result.retryAfterMs || Number(result.intervalSeconds || 5) * 1000))
+                    root.devicePollTimer.restart()
                 } else if (status === "slow_down") {
-                    root.authChallenge.intervalSeconds = Number(result.intervalSeconds || 10)
+                    root.devicePollTimer.interval = Math.max(1000, Number(result.retryAfterMs || Number(result.intervalSeconds || 5) * 1000))
                     root.devicePollTimer.restart()
                 } else {
-                    root.devicePollTimer.stop()
+                    root.cancelDeviceLogin()
                     root.authState = "error"
                     root.authMessage = result.error || qsTr("Device sign-in failed")
                 }
@@ -2666,6 +3500,11 @@ QtObject {
                     root.reloadCatalogForSession()
                 if (root.authSession)
                     root.refreshAccountServices()
+                if (root.authSession) {
+                    root.addingAccount = false
+                    if (AppController.route === "sign-in")
+                        AppController.navigate(root.activeSession && root.sessionOwnerSignedIn() ? "stream" : "home")
+                }
                 root.resolveDirectLaunch()
             } else if (requestId === root.logoutRequestId) {
                 root.authSession = result.session || null
@@ -2678,6 +3517,7 @@ QtObject {
                 root.regions = []
                 root.resetRegionPing()
                 root.reloadCatalogForSession()
+                root.refreshSavedAccounts(true)
                 if (root.authSession)
                     root.refreshAccountServices()
             } else if (requestId === root.logoutAllRequestId) {
@@ -2691,6 +3531,7 @@ QtObject {
                 root.regions = []
                 root.resetRegionPing()
                 root.reloadCatalogForSession()
+                root.refreshSavedAccounts(true)
                 root.accessibilityMessage = qsTr("All saved accounts signed out")
             } else if (requestId === root.subscriptionRequestId) {
                 accountServicesOwner.acceptSubscription(result)
@@ -2701,6 +3542,7 @@ QtObject {
             } else if (requestId === root.accountsRequestId) {
                 root.savedAccounts = result.accounts || []
                 root.accountsRequestId = ""
+                root.showSavedAccountSelection()
             } else if (requestId === root.accountSwitchRequestId) {
                 root.resetRegionPing()
                 root.regions = []
@@ -2713,19 +3555,20 @@ QtObject {
                 root.reloadCatalogForSession()
                 root.refreshAccountServices()
                 root.pinMessage = qsTr("")
-                if (AppController.route === "profile-pin")
+                if (root.authSession && root.activeSession && root.sessionOwnerSignedIn()
+                        && ["accounts", "profile-pin"].indexOf(AppController.route) >= 0)
+                    AppController.navigate("stream")
+                else if (AppController.route === "profile-pin")
                     AppController.navigate("accounts")
             } else if (requestId === root.accountRemoveRequestId) {
                 root.accountRemoveRequestId = ""
-                if (root.accountsRequestId === "")
-                    root.accountsRequestId = CoreClient.request("auth.accounts.list", {})
+                root.refreshSavedAccounts(true)
                 root.authSessionRequestId = CoreClient.request("auth.session.get", {})
             } else if (requestId === root.pinRequestId) {
                 root.pinRequestId = ""
                 if (result.ok) {
                     root.pinMessage = qsTr("")
-                    if (root.accountsRequestId === "")
-                        root.accountsRequestId = CoreClient.request("auth.accounts.list", {})
+                    root.refreshSavedAccounts(true)
                     AppController.navigate("accounts")
                 } else {
                     root.pinMessage = result.reason === "locked_out"
@@ -2839,7 +3682,8 @@ QtObject {
                     AppController.showOverlay("")
             } else if (requestId === root.activeSessionRequestId) {
                 root.activeSessionRequestId = ""
-                root.acceptStreamingSession(result.session || null)
+                if (!root.activeSession)
+                    root.acceptStreamingSession(result.session || null)
             } else if (requestId === root.remoteSessionDiscoveryRequestId) {
                 root.remoteSessionDiscoveryRequestId = ""
                 root.remoteSessions = result.sessions || []
@@ -2870,14 +3714,44 @@ QtObject {
                 root.streamCreateRequestId = ""
                 root.launchConflictDetected = false
                 root.acceptStreamingSession(result.session || null)
+                if (root.activeSession)
+                    root.streamRequestedColorQuality = root.pendingRequestedColorQuality
+                root.pendingRequestedColorQuality = ""
             } else if (requestId === root.streamPollRequestId) {
                 root.streamPollRequestId = ""
-                root.acceptStreamingSession(result.session || null)
+                if (!root.acceptsSessionScope(result.scope)) return
+                const restoring = root.coreSessionRestoreId !== ""
+                if (restoring && (!result.session
+                        || String(result.session.sessionId) !== root.coreSessionRestoreId)) {
+                    root.handleStreamPollFailure("session_restore_failed",
+                        qsTr("We couldn't check whether your game is still running. Check your connection, then try again."))
+                    return
+                }
+                root.coreSessionRestoreId = ""
+                root.sessionRecoveryAwaitingAuth = false
+                root.streamPollFailureAttempts = 0
+                if (root.isRemoteSessionTermination(result.termination))
+                    root.finishRemoteSession(result.termination)
+                else if (restoring && root.sessionStopIntentId === String(result.session.sessionId)) {
+                    root.acceptStreamingSession(result.session)
+                    root.stopStreamingSession()
+                }
+                else if (restoring && root.streamer && !root.streamerStopExpected
+                        && (root.streamer.status === "error" || root.streamer.status === "stopped")) {
+                    root.sessionRecoveryPending = true
+                    root.acceptStreamingSession(result.session)
+                    root.sessionRecoveryPending = false
+                    root.scheduleSessionRecovery(root.streamer.message)
+                } else {
+                    root.acceptStreamingSession(result.session || null)
+                }
             } else if (requestId === root.streamStopRequestId) {
                 root.streamStopRequestId = ""
                 const wasForceNewAfterStop = root.forceNewAfterStop
                 root.remoteSessions = []
-                root.acceptStreamingSession(null)
+                root.acceptStreamingSession(result.session || null)
+                if (root.activeSession && String(root.activeSession.sessionId) !== String(result.sessionId))
+                    return
                 if (root.forceNewAfterStop) {
                     root.forceNewAfterStop = false
                     root.conflictSession = null
@@ -2893,7 +3767,12 @@ QtObject {
                     AppController.showOverlay("session-report")
             } else if (requestId === root.streamerPrepareRequestId) {
                 root.streamerPrepareRequestId = ""
-                if (!result.context) {
+                if (!root.ready || !root.activeSession
+                        || (result.session && String(result.session.sessionId) !== String(root.activeSession.sessionId))
+                        || root.streamStopRequestId !== "" || root.streamerStopRequestId !== ""
+                        || root.sessionRecoveryPending)
+                    return
+                if (!result.context || !result.session) {
                     root.acceptStreamerSnapshot(Object.assign({}, root.streamer || ({}), {
                         status: "error",
                         message: qsTr("The core returned an invalid embedded stream context"),
@@ -2901,6 +3780,7 @@ QtObject {
                     }))
                     return
                 }
+                root.activeSession = result.session
                 const preparedSettings = result.context.settings || ({})
                 const initialMicrophoneEnabled = root.prepareMicrophoneStart(
                     root.activeSession.sessionId, preparedSettings.microphoneMode)
@@ -2930,6 +3810,7 @@ QtObject {
             }
         }
         function onRequestFailed(requestId, code, message) {
+            if (settingsOwner.acceptFailure(requestId, message)) return
             if (onboardingOwner.acceptFailure(requestId, message)) {
                 return
             } else if (requestId === root.storePresentationRequestId && requestId !== "") {
@@ -2943,36 +3824,40 @@ QtObject {
                 root.remoteSessions = []
                 return
             }
-            root.lastError = message
+            if (code !== "cancelled") root.lastError = message
             if (requestId === root.consoleSurfaceRequestId) {
                 settingsOwner.failConsoleSurface(message)
             } else if (requestId === root.catalogRequestId) {
-                catalogOwner.failCatalog(message)
+                catalogOwner.failCatalog(message, code)
             } else if (requestId === root.storeRequestId) {
                 catalogOwner.failStore(message)
             } else if (requestId === root.providersRequestId) {
                 root.providersRequestId = ""
+                if (code !== "cancelled") root.scheduleProviderRetry(0)
             } else if (requestId === root.authSessionRequestId) {
                 root.authSessionRequestId = ""
                 root.authRestorePending = false
                 root.authState = root.authSession ? "signed-in" : "idle"
                 if (code !== "cancelled")
                     root.authMessage = message
+                if (root.coreSessionRestoreId !== "" && code !== "cancelled")
+                    root.handleStreamPollFailure(code, message)
             } else if (requestId === root.deviceStartRequestId
                        || requestId === root.devicePollRequestId
                        || requestId === root.deviceCompleteRequestId) {
-                root.devicePollTimer.stop()
-                root.authState = code === "cancelled" ? "idle" : "error"
-                root.authMessage = code === "cancelled" ? "" : message
                 root.deviceStartRequestId = ""
                 root.devicePollRequestId = ""
                 root.deviceCompleteRequestId = ""
+                root.cancelDeviceLogin()
+                root.authState = code === "cancelled" ? "idle" : "error"
+                root.authMessage = code === "cancelled" ? "" : message
             } else if (requestId === root.logoutRequestId) {
                 root.logoutRequestId = ""
                 root.authMessage = message
             } else if (requestId === root.logoutAllRequestId) {
                 root.logoutAllRequestId = ""
                 root.authMessage = message
+                root.accountMessage = message
             } else if (requestId === root.subscriptionRequestId) {
                 accountServicesOwner.failSubscription(message)
             } else if (requestId === root.regionsRequestId) {
@@ -2984,8 +3869,10 @@ QtObject {
             } else if (requestId === root.accountSwitchRequestId) {
                 root.accountSwitchRequestId = ""
                 root.pinMessage = message
+                root.accountMessage = message
             } else if (requestId === root.accountRemoveRequestId) {
                 root.accountRemoveRequestId = ""
+                root.accountMessage = message
             } else if (requestId === root.pinRequestId) {
                 root.pinRequestId = ""
                 root.pinMessage = message
@@ -3041,6 +3928,7 @@ QtObject {
                 root.reconcileUpdaterFailure(message)
             } else if (requestId === root.updaterInstallRequestId) {
                 root.updaterInstallRequestId = ""
+                root.updaterFailureMessage = message
                 root.reconcileUpdaterFailure(message)
             } else if (requestId === root.socialCapabilitiesRequestId) {
                 root.socialCapabilitiesRequestId = ""
@@ -3077,7 +3965,10 @@ QtObject {
                 root.sessionClaimRequestId = ""
                 root.sessionClaimIsRecovery = false
                 if (recovering) {
-                    root.scheduleSessionRecovery(message)
+                    if (code === "session_not_found")
+                        root.finishRemoteSession({source: "cloudmatch-http", httpStatus: 404, resumable: false})
+                    else
+                        root.scheduleSessionRecovery(message)
                 } else {
                     root.conflictSessionNeedsRefresh = true
                     root.streamState = "conflict"
@@ -3090,18 +3981,7 @@ QtObject {
                 root.handleSessionCreateFailure(code, message)
             } else if (requestId === root.streamPollRequestId) {
                 root.streamPollRequestId = ""
-                if (root.activeSession && root.activeSession.resumePending) {
-                    root.streamMessage = qsTr("Waiting for the resumed session…")
-                    root.streamPollTimer.restart()
-                    return
-                }
-                root.sessionReconnectAttempts += 1
-                root.streamState = root.activeSession && root.sessionReconnectAttempts <= 8 ? "reconnecting" : "error"
-                root.streamMessage = root.streamState === "reconnecting"
-                    ? qsTr("Connection interrupted. Retrying…")
-                    : message
-                if (root.streamState === "reconnecting")
-                    root.streamPollTimer.restart()
+                root.handleStreamPollFailure(code, message)
             } else if (requestId === root.streamStopRequestId) {
                 root.streamStopRequestId = ""
                 root.forceNewAfterStop = false
@@ -3121,14 +4001,30 @@ QtObject {
             } else if (name === "settings.reset")
                 root.refreshSettings()
             else if (name === "auth.session.changed") {
-                root.authSession = payload.session || null
+                if (!root.acceptAuthEnvelope(payload))
+                    return
                 root.authState = root.authSession ? "signed-in" : "idle"
                 if (root.authSession)
                     root.refreshRemoteSessions()
                 else
                     root.remoteSessions = []
-            } else if (name === "session.changed")
-                root.acceptStreamingSession(payload.session || null)
+            } else if (name === "session.cleanup.pending") {
+                root.lastError = String(payload.message || "")
+                root.streamMessage = root.lastError
+                root.refreshRemoteSessions()
+            } else if (name === "session.changed") {
+                const ownedTermination = root.ownedSessionTermination(payload)
+                if (ownedTermination) {
+                    root.finishRemoteSession(ownedTermination)
+                    return
+                }
+                if (!root.acceptsSessionScope(payload.scope)) return
+                if (root.isRemoteSessionTermination(payload.termination))
+                    root.finishRemoteSession(payload.termination)
+                else
+                    root.acceptStreamingSession(payload.session || null)
+            } else if (name === "account.push.changed")
+                root.acceptPushInvalidation(payload)
             else if (name === "streamer.changed")
                 root.acceptStreamerSnapshot(payload.streamer || payload || null)
             else if (name === "artwork.ready")

@@ -8,13 +8,15 @@ on:
         type: boolean
         default: false
       public_key:
-        description: Canonical base64 Ed25519 public key (32 bytes; required to publish)
+        description: Production Ed25519 public key (leave default for verified updates)
         type: string
-        default: ""
+        default: HoyKVmfuH+KDioPCJJNxOB2e/bXJoOALSjo1QeMsDlk=
   pull_request:
     branches:
       - dev
       - main
+      - capy/explain-cloud-session-setup
+      - capy/gfn-correctness/**
     paths:
       - ".github/workflows/qt-ci.yml"
       - ".github/workflows/qt-build.yml"
@@ -72,8 +74,19 @@ jobs:
       - name: Require a pinned public key for publication
         env:
           OPENNOW_UPDATE_PUBLIC_KEY: ${{ inputs.public_key }}
-          PUBLISH_NIGHTLY: ${{ inputs.publish_nightly }}
+          PUBLISH_RELEASE: ${{ inputs.publish_nightly }}
         run: python3 opennow-qt/packaging/sign_nightly_release.py preflight
+      - name: Require a nightly base newer than the published stable
+        if: inputs.publish_nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python3 opennow-qt/packaging/nightly_release.py version \
+            --run "$GITHUB_RUN_NUMBER" --attempt "$GITHUB_RUN_ATTEMPT")
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > "$RUNNER_TEMP/releases.json"
+          python3 opennow-qt/packaging/sign_nightly_release.py release-guard \
+            --version "$version" --releases "$RUNNER_TEMP/releases.json"
 
   contracts:
     name: Shared checks
@@ -157,7 +170,7 @@ jobs:
         with:
           name: opennow-qt-${{ needs.build.outputs.version }}-complete-unsigned
           path: unsigned-release
-      - name: Sign and verify the immutable nine-package inventory
+      - name: Sign and verify the immutable packages and AppImage sidecars
         env:
           OPENNOW_UPDATE_PUBLIC_KEY: ${{ inputs.public_key }}
           OPENNOW_UPDATE_ED25519_PRIVATE_KEY: ${{ secrets.OPENNOW_UPDATE_ED25519_PRIVATE_KEY }}
@@ -205,7 +218,7 @@ jobs:
           python3 opennow-qt/packaging/sign_nightly_release.py verify \
             --source nightly-release --version "$RELEASE_VERSION" --commit "$SOURCE_SHA"
           (cd nightly-release && sha256sum --check --strict SHA256SUMS)
-      - name: Publish only after the complete upload succeeds
+      - name: Upload the complete draft release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -214,5 +227,19 @@ jobs:
             --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" \
             --title "OpenNOW v$RELEASE_VERSION" --generate-notes \
             --draft --prerelease --latest=false
+      - name: Require a nightly base newer than the published stable
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > "$RUNNER_TEMP/releases.json"
+          python3 opennow-qt/packaging/sign_nightly_release.py release-guard \
+            --version "$RELEASE_VERSION" --releases "$RUNNER_TEMP/releases.json"
+      - name: Publish the verified draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           gh release edit "v$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" \
             --draft=false --prerelease --latest=false

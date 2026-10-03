@@ -9,6 +9,7 @@ Item {
     property bool expanded: false
     property bool pointerLocked: false
     property var frameGenerationStats: ({})
+    property var swapStats: ({})
     enabled: !pointerLocked
     signal cycleRequested()
     signal copyRequested()
@@ -27,8 +28,8 @@ Item {
             clockPill.visible && clockPill.x + clockPill.width > width - 408 ? clockPill.y + clockPill.height + 12 : inset)
     readonly property color surface: Qt.rgba(14 / 255, 16 / 255, 24 / 255,
         Math.max(0.4, Math.min(1, Number(ShellStore.settings.statsOverlayOpacity || 85) / 100)))
-    readonly property bool degraded: telemetryActive && read("packetLossPercent") > 0
-    readonly property bool healthKnown: telemetryActive && read("packetLossPercent") !== null
+    readonly property bool degraded: telemetryActive && ShellStore.connectionHealth.status === "unstable"
+    readonly property bool healthKnown: telemetryActive && ShellStore.connectionHealth.status !== "unknown"
     readonly property color accent: degraded ? "#F5A623" : "#6EE7B7"
     readonly property color statusColor: !healthKnown || degraded ? "#F5A623" : "#1DB954"
     readonly property color metricColor: degraded ? accent : "white"
@@ -38,9 +39,10 @@ Item {
         || numeric(profile.maxBitrateMbps) || numeric(ShellStore.settings.maxBitrateMbps) || 0)
     readonly property real bitrateUsage: allocatedBitrateMbps > 0 && read("bitrateMbps") !== null
         ? Math.max(0, Math.min(1, read("bitrateMbps") / allocatedBitrateMbps)) : 0
-    readonly property string toggleShortcut: String(ShellStore.settings.shortcutToggleStats || "Ctrl+N")
+    readonly property string toggleShortcut: String(ShellStore.settings.shortcutToggleStats ?? "Ctrl+N")
     readonly property var heroCards: ["Fps", "Ping", "Latency"].map(key => cards.find(card => card.key === key)).filter(card => card !== undefined)
-    readonly property var ledgerCards: cards.filter(card => ["Jitter", "Drops", "PacketLoss", "Decode", "LocalOutputFps"].includes(card.key)
+    readonly property var unmeasuredKeys: ["Decode", "Residence", "Latency", "Swap"]
+    readonly property var ledgerCards: cards.filter(card => ["Receive", "Jitter", "Drops", "PacketLoss", "Decode", "Residence", "Swap", "LocalOutputFps"].includes(card.key)
         && (card.key !== "Drops" || card.field === "videoDropCount" || card.value > 0))
     readonly property var featureBadges: {
         const badges = []
@@ -61,10 +63,21 @@ Item {
     }
     function read(key) {
         if (!telemetryActive) return null
+        if (key === "packetLossPercent") return ShellStore.connectionHealth.lastLoss
         const drops = ShellStore.streamDropCounts
         return numeric(drops[key] !== undefined ? drops[key] : live[key])
     }
     function frameGenerationOutputFps() { return numeric(frameGenerationStats.outputFps) }
+    function qtSubmitToSwapP50Ms() { return numeric(swapStats.p50Ms) }
+    readonly property bool swapGated: swapStats.gated === true
+    readonly property string swapGateSource: String(swapStats.gateSource || "")
+    function swapGateText() {
+        switch (swapGateSource) {
+        case "minimized": return qsTr("Window minimized")
+        case "hidden": return qsTr("Window hidden")
+        default: return qsTr("Unavailable")
+        }
+    }
     function frameGenerationState() {
         switch (String(frameGenerationStats.status || "unavailable")) {
         case "off": return qsTr("Off")
@@ -79,8 +92,9 @@ Item {
         }
     }
     function sample(card) {
-        return card.field === "frameGenerationOutputFps"
-            ? frameGenerationOutputFps() : read(card.field)
+        if (card.field === "frameGenerationOutputFps") return frameGenerationOutputFps()
+        if (card.field === "qtSubmitToSwapMs") return qtSubmitToSwapP50Ms()
+        return read(card.field)
     }
     function format(value, decimals) { return numeric(value) === null ? qsTr("N/A") : Number(value).toFixed(decimals || 0) }
     function elapsedText() {
@@ -101,7 +115,10 @@ Item {
         const w = Number(profile.width || dimensions[0] || live.outputWidth || 0), h = Number(profile.height || dimensions[1] || live.outputHeight || 0)
         if (w && h) parts.push(w + "×" + h)
         const colors = {"8bit_420":"8-bit 4:2:0", "8bit_444":"8-bit 4:4:4", "10bit_420":"10-bit 4:2:0", "10bit_444":"10-bit 4:4:4"}
-        if (colors[profile.colorQuality]) parts.push(colors[profile.colorQuality])
+        const observed = ShellStore.streamColorFormat
+        const colorQuality = observed && observed.sessionId === String(session.sessionId || "")
+            ? observed.actualColorQuality : profile.colorQuality
+        if (colors[colorQuality]) parts.push(colors[colorQuality])
         else {
             if (profile.bitDepth) parts.push(profile.bitDepth + "-bit")
             if (profile.chroma) parts.push(String(profile.chroma))
@@ -113,7 +130,8 @@ Item {
         const cards = [
             {key:"Ping", label:qsTr("PING"), value:read("pingMs"), unit:"ms", field:"pingMs"},
             {key:"Fps", label:qsTr("STREAM FPS"), value:read("framesPerSecond"), unit:"fps", field:"framesPerSecond"},
-            {key:"Bitrate", label:qsTr("BITRATE"), value:read("bitrateMbps"), unit:"Mbps", field:"bitrateMbps", decimals:1},
+            {key:"Bitrate", label:qsTr("VIDEO BITRATE"), value:read("bitrateMbps"), unit:"Mbps", field:"bitrateMbps", decimals:1},
+            {key:"Receive", label:qsTr("STREAM UDP RECEIVE"), value:read("receiveBitrateMbps"), unit:"Mbps", field:"receiveBitrateMbps", decimals:1},
             {key:"Jitter", label:qsTr("JITTER"), value:read("jitterMs"), unit:"ms", field:"jitterMs", decimals:1},
             {key:"Drops", label:qsTr("VIDEO DROPS"), value:read("videoDropCount"), unit:qsTr("frames"), field:"videoDropCount"},
             {key:"Drops", label:qsTr("AUDIO DISCARDED"), value:read("audioDiscardedMs"), unit:"ms", field:"audioDiscardedMs", decimals:1},
@@ -121,14 +139,17 @@ Item {
             {key:"Drops", label:qsTr("CALLBACK DROPS"), value:read("callbackDropCount"), unit:qsTr("callbacks"), field:"callbackDropCount"},
             {key:"PacketLoss", label:qsTr("PACKET LOSS"), value:read("packetLossPercent"), unit:"%", field:"packetLossPercent", decimals:1},
             {key:"Decode", label:qsTr("DECODE"), value:read("decodeTimeMs"), unit:"ms", field:"decodeTimeMs", decimals:1},
+            {key:"Residence", label:qsTr("DECODER RESIDENCE"), value:read("decoderResidenceMs"), unit:"ms", field:"decoderResidenceMs", decimals:1},
+            {key:"Swap", label:qsTr("QT SUBMIT TO SWAP"), value:qtSubmitToSwapP50Ms(), unit:"ms", field:"qtSubmitToSwapMs", decimals:1},
             {key:"Latency", label:qsTr("LATENCY"), value:read("latencyMs"), unit:"ms", field:"latencyMs"}
         ]
         if (read("otherQueueDropCount") > 0)
             cards.push({key:"Drops", label:qsTr("UNCLASSIFIED DROPS"), value:read("otherQueueDropCount"), unit:qsTr("items"), field:"otherQueueDropCount"})
         if (frameGenerationEnabled)
             cards.push({key:"LocalOutputFps", label:qsTr("LOCAL OUTPUT FPS"), value:frameGenerationOutputFps(), unit:"fps", field:"frameGenerationOutputFps"})
-        return cards.filter(item => shown(item.key)
-            && ((item.key !== "Decode" && item.key !== "Latency") || item.value !== null))
+        return cards.filter(item => shown(item.key === "Receive" ? "Bitrate" : item.key)
+            && (!unmeasuredKeys.includes(item.key) || item.value !== null
+                || (item.key === "Swap" && swapGated)))
     }
     function compactItems() {
         const items = cards.map(item => ({text:item.label + " " + format(item.value, item.decimals) + " " + item.unit}))
@@ -142,6 +163,8 @@ Item {
         const lines = cards.map(item => item.label + ": " + format(item.value, item.decimals) + " " + item.unit)
         if (frameGenerationEnabled)
             lines.push(qsTr("FRAME GENERATION") + ": " + frameGenerationState())
+        if (swapGated)
+            lines.push(qsTr("SWAP GATE") + ": " + swapGateText())
         if (shown("Region")) lines.unshift(region + (rig ? " · " + rig : ""))
         if (shown("Video")) lines.push(videoText)
         if (shown("Clock")) lines.push(qsTr("Session: ") + elapsedText())
@@ -157,12 +180,14 @@ Item {
         history = next
     }
     function ledgerDetail(card) {
+        if (card.field === "receiveBitrateMbps") return qsTr("known session peer · UDP datagram bytes")
         if (card.field === "jitterMs") {
             const samples = (history.jitterMs || []).filter(value => value !== null)
             return samples.length ? qsTr("max %1 · 60 s").arg(format(Math.max(...samples), 1)) : ""
         }
         if (card.field === "videoDropCount") return qsTr("session total")
         if (card.field === "decodeTimeMs") return telemetryActive ? String(live.mediaBackend || "") : ""
+        if (card.field === "qtSubmitToSwapMs") return swapGated ? swapGateText() : ""
         return ""
     }
     onTelemetryActiveChanged: resetHistory()
@@ -240,6 +265,7 @@ Item {
                     const metrics = []
                     if (root.shown("Fps")) metrics.push({value:root.format(root.read("framesPerSecond")), unit:"fps"})
                     if (root.shown("Ping")) metrics.push({value:root.format(root.read("pingMs")), unit:"ms"})
+                    if (root.shown("Bitrate")) metrics.push({value:qsTr("UDP RX") + " " + root.format(root.read("receiveBitrateMbps"), 1), unit:"Mbps", socketReceive:true})
                     if (root.shown("Region")) metrics.push({value:root.region, unit:"", region:true})
                     if (root.shown("Video")) {
                         const h = Number(root.profile.height || String(root.profile.resolution || "").split("x")[1] || root.live.outputHeight || 0)
@@ -259,6 +285,7 @@ Item {
                         Image { visible: compactMetric.modelData.region === true; anchors.verticalCenter: parent.verticalCenter; width: 11; height: 11; sourceSize: Qt.size(22, 22); source: "qrc:/qt/qml/OpenNOW/res/icons/stats-globe.svg" }
                         Mono {
                             id: compactValue
+                            objectName: compactMetric.modelData.socketReceive === true ? "compactSocketReceive" : ""
                             text: compactMetric.modelData.value
                             width: Math.min(implicitWidth, compactMetric.modelData.region ? 180 : 100)
                             font.pixelSize: compactMetric.modelData.region ? 10.5 : 12.5
@@ -281,7 +308,7 @@ Item {
             Row {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 6
-                KeyboardGlyph { shortcut: root.toggleShortcut; keySize: 20; ink: "white" }
+                KeyboardGlyph { visible: root.toggleShortcut !== ""; shortcut: root.toggleShortcut; keySize: 20; ink: "white" }
                 Text { anchors.verticalCenter: parent.verticalCenter; text: qsTr("more"); color: "#8CFFFFFF"; font.family: Theme.bodyFont; font.pixelSize: 11; font.weight: Font.DemiBold }
             }
         }
@@ -351,7 +378,7 @@ Item {
                 Item {
                     visible: root.shown("Bitrate")
                     width: parent.width; height: 41
-                    Mono { x: 16; y: 2; text: qsTr("BITRATE"); font.pixelSize: 10; font.letterSpacing: 0.95; color: "#80FFFFFF" }
+                    Mono { x: 16; y: 2; text: qsTr("VIDEO BITRATE"); font.pixelSize: 10; font.letterSpacing: 0.95; color: "#80FFFFFF" }
                     Row {
                         anchors.right: parent.right; anchors.rightMargin: 16; spacing: 4
                         Mono { id: bitrateValue; text: root.format(root.read("bitrateMbps"), 1); font.pixelSize: 12; color: root.metricColor }
@@ -381,7 +408,8 @@ Item {
                                 text: root.format(ledger.modelData.value, ledger.modelData.decimals)
                                     + (ledger.modelData.field === "videoDropCount" ? "" : ledger.modelData.unit === "%" ? "%" : " " + ledger.modelData.unit)
                                 color: root.degraded && ledger.modelData.key === "PacketLoss" ? "#D15A2C"
-                                    : ledger.modelData.key === "Decode" ? "white" : root.metricColor
+                                    : ledger.modelData.key === "Decode" || ledger.modelData.key === "Residence"
+                                        || ledger.modelData.key === "Swap" ? "white" : root.metricColor
                             }
                         }
                     }

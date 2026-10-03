@@ -73,14 +73,27 @@ void HdrOutput::attach(QQuickWindow *window)
         }
     }, Qt::DirectConnection);
     connect(window, &QWindow::screenChanged, this, [this] {
-        if (m_supported) {
-            m_supported = false;
-            emit changed();
-        }
-        m_probeRequested.store(true);
-        m_window->update();
+        const bool wasSupported = m_supported;
+        m_supported = false;
+        if (wasSupported && !m_display.available) emit changed();
+        invalidateDisplay();
     });
+#if defined(Q_OS_WIN)
+    connect(window, &QWindow::xChanged, this, &HdrOutput::invalidateDisplay);
+    connect(window, &QWindow::yChanged, this, &HdrOutput::invalidateDisplay);
+    connect(window, &QWindow::widthChanged, this, &HdrOutput::invalidateDisplay);
+    connect(window, &QWindow::heightChanged, this, &HdrOutput::invalidateDisplay);
+#endif
     m_probeTimer.start();
+}
+
+void HdrOutput::invalidateDisplay()
+{
+    const bool changed = m_display.available;
+    m_display = {};
+    if (changed) emit this->changed();
+    m_probeRequested.store(true);
+    if (m_window) m_window->update();
 }
 
 HdrOutput::State HdrOutput::renderState()
@@ -100,14 +113,39 @@ void HdrOutput::publish(State state)
     s_whiteNits.store(state.whiteNits);
     s_supported.store(state.supported);
     QMetaObject::invokeMethod(this, [this, state]() mutable {
+        const auto wayland = m_waylandOutput->state();
 #if defined(Q_OS_LINUX)
-        state.supported = state.supported && m_waylandOutput->state().supported;
+        state.supported = state.supported && wayland.supported;
 #endif
-        if (m_supported == state.supported && m_mode == state.outputMode) return;
+        DisplayData next;
+        if (wayland.supported) {
+            next.available = true;
+            next.minimumNits = double(wayland.targetMinimumNits);
+            next.maximumNits = double(wayland.targetMaximumNits);
+        }
+#if defined(Q_OS_WIN)
+        const auto windows = state.supported ? activeWindowsHdrDisplay(m_window) : std::nullopt;
+        if (windows) {
+            next.available = true;
+            next.minimumNits = windows->minimumNits;
+            next.maximumNits = windows->maximumNits;
+            next.maximumFullFrameNits = windows->maximumFullFrameNits;
+            next.chromaticity = windows->chromaticity;
+        }
+#endif
+        const bool displayChanged = next != m_display;
+        m_display = next;
+        if (m_supported == state.supported && m_mode == state.outputMode && !displayChanged) return;
         m_supported = state.supported;
         m_mode = state.outputMode;
         emit changed();
     }, Qt::QueuedConnection);
+}
+
+HdrOutput::DisplayData HdrOutput::displayData() const
+{
+    if (!m_supported) return {};
+    return m_display;
 }
 
 void HdrOutput::requestChrome(bool required)

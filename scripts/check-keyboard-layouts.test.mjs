@@ -8,43 +8,50 @@ const settings = readQml("state/settings/SettingsState.qml");
 const facade = readQml("state/ShellStore.qml");
 const desktop = readQml("desktop/settings/pages/DesktopSettingsControlsPage.qml");
 const consoleSettings = readQml("screens/SettingsScreen.qml");
-const expectedItems = [
-  { label: "English (US)", value: "en-US" },
-  { label: "English (UK)", value: "en-GB" },
-  { label: "Türkçe (Q)", value: "tr-TR" },
-  { label: "Deutsch", value: "de-DE" },
-  { label: "Français", value: "fr-FR" },
-  { label: "Español", value: "es-ES" },
-  { label: "Español (Latinoamérica)", value: "es-MX" },
-  { label: "Italiano", value: "it-IT" },
-  { label: "Português (Portugal)", value: "pt-PT" },
-  { label: "Português (Brasil)", value: "pt-BR" },
-  { label: "Polski", value: "pl-PL" },
-  { label: "Dansk", value: "da-DK" },
-  { label: "Norsk", value: "nb-NO" },
-  { label: "Svenska", value: "sv-SE" },
-  { label: "Suomi", value: "fi-FI" },
-  { label: "Русский", value: "ru-RU" },
-  { label: "Українська", value: "uk-UA" },
-  { label: "日本語", value: "ja-JP" },
-  { label: "한국어", value: "ko-KR" },
-  { label: "中文（简体）", value: "zh-CN" },
-  { label: "中文（繁體）", value: "zh-TW" },
+const expectedIds = [
+  "en-US", "en-GB", "tr-TR", "de-DE", "fr-FR", "es-ES_tradnl", "es-MX",
+  "it-IT", "pt-PT", "pt-BR", "pl-PL", "da-DK", "nb-NO", "sv-SE", "fi-FI",
+  "ru-RU", "uk-UA", "ja-106", "ko-KR", "zh-CN", "zh-TW",
 ];
+const language = readFileSync(new URL("../native/opennow-core/src/language.rs", import.meta.url), "utf8");
+const keyboardTable = language.match(/const KEYBOARDS:[\s\S]*?=\s*&\[([\s\S]*?)\n\];/);
+assert.ok(keyboardTable, "the core must own the keyboard descriptors");
+const descriptors = [...keyboardTable[1].matchAll(/\("([^"]+)", "([^"]+)", &\[([^\]]*)\]\)/g)]
+  .map(([, value, label, aliases]) => ({ value, label, aliases: JSON.parse(`[${aliases}]`) }));
 
-function layoutItems() {
-  const declaration = settings.match(/readonly property var keyboardLayoutItems:\s*(\[[\s\S]*?\n\s*\])/);
-  assert.ok(declaration, "SettingsState must own a readonly keyboard layout list");
-  return JSON.parse(JSON.stringify(runInNewContext(declaration[1])));
+function layoutItems(saved = "en-US", choices = descriptors) {
+  const declaration = settings.match(/readonly property var keyboardLayoutItems:\s*\{([\s\S]*?)\n    \}/);
+  assert.ok(declaration, "SettingsState must derive its choices from the core descriptors");
+  return JSON.parse(JSON.stringify(runInNewContext(`
+    String.prototype.arg = function(value) { return this.replace("%1", value); };
+    (function() { ${declaration[1]} })()
+  `, {
+    keyboardLayouts: choices,
+    settings: { keyboardLayout: saved },
+    i18n: { source: (text) => text },
+    qsTr: (text) => text,
+  })));
 }
 
-test("the canonical list preserves all 21 unique locale and native-label pairs", () => {
+test("the core offers all 21 layouts and the UI preserves its descriptors", () => {
   const items = layoutItems();
   assert.equal(items.length, 21);
   assert.equal(new Set(items.map((item) => item.value)).size, items.length);
-  assert.deepEqual(items, expectedItems);
-  assert.deepEqual(items.find((item) => item.value === "ru-RU"), { label: "Русский", value: "ru-RU" });
-  assert.deepEqual(items.find((item) => item.value === "uk-UA"), { label: "Українська", value: "uk-UA" });
+  assert.deepEqual(items.map((item) => item.value), expectedIds);
+  assert.deepEqual(items, descriptors.map(({ value, label }) => ({ value, label })));
+  assert.equal(items.find((item) => item.value === "ru-RU").label, "Russian");
+  assert.equal(items.find((item) => item.value === "uk-UA").label, "Ukrainian");
+});
+
+test("saved aliases and unavailable choices remain visible without changing preferences", () => {
+  for (const [saved, canonical] of [["ja-JP", "ja-106"], ["Japanese106", "ja-106"], ["es-ES", "es-ES_tradnl"]]) {
+    const [item] = layoutItems(saved);
+    assert.equal(item.value, saved);
+    assert.equal(item.disabled, true);
+    assert.equal(item.detail, `Saved legacy ID; requests ${canonical}`);
+  }
+  assert.equal(layoutItems("unknown")[0].detail, "Saved; layout not recognized");
+  assert.equal(layoutItems("ja-106", [])[0].detail, "Saved; keyboard choices unavailable");
 });
 
 test("the desktop choice consumes the canonical list through the ShellStore alias", () => {
@@ -56,24 +63,25 @@ test("the desktop choice consumes the canonical list through the ShellStore alia
   assert.match(choice[1], /setChoice\("keyboardLayout", value\)/);
 });
 
-test("the console choice derives aligned values and labels from the same canonical list", () => {
-  const choice = consoleSettings.match(/rows\.push\((choice\("Keyboard layout",[\s\S]*?)\)\s*\n/);
+test("the console choice consumes the same descriptors and disabled-state metadata", () => {
+  const choice = consoleSettings.match(/rows\.push\((descriptorChoice\(qsTr\("Keyboard layout"\),[\s\S]*?)\)\s*\n/);
   assert.ok(choice, "the console keyboard picker must exist");
-  assert.match(choice[1], /ShellStore\.keyboardLayoutItems\.map\(item => item\.value\)/);
-  assert.match(choice[1], /ShellStore\.keyboardLayoutItems\.map\(item => item\.label\)/);
+  assert.match(choice[1], /"keyboardLayout", ShellStore\.keyboardLayoutItems/);
+  const items = layoutItems("ja-JP");
   const result = runInNewContext(choice[1], {
-    ShellStore: { keyboardLayoutItems: layoutItems() },
-    choice: (title, description, key, values, labels) => ({ key, values, labels }),
+    ShellStore: { keyboardLayoutItems: items, settingsOwnerState: { keyboardLayoutDescription: "fixture" } },
+    qsTr: (text) => text,
+    descriptorChoice: (title, description, key, descriptors) => ({ key, descriptors }),
   });
   assert.equal(result.key, "keyboardLayout");
-  assert.deepEqual(result.values, expectedItems.map((item) => item.value));
-  assert.deepEqual(result.labels, expectedItems.map((item) => item.label));
+  assert.deepEqual(result.descriptors, items);
 });
 
 test("every offered layout has a native physical-key table", () => {
   const tables = readFileSync(new URL("../opennow-qt/src/streaming/PhysicalKeyMapData.h", import.meta.url), "utf8");
   const locales = [...tables.matchAll(/\{"([a-z]{2}-[A-Z]{2})",/g)].map((match) => match[1]);
-  assert.deepEqual(locales.sort(), layoutItems().map((item) => item.value).sort());
+  const tableAliases = { "ja-106": "ja-JP", "es-ES_tradnl": "es-ES" };
+  assert.deepEqual(locales.sort(), descriptors.map((item) => tableAliases[item.value] || item.value).sort());
 });
 
 test("both stream surfaces use the session layout rather than the live preference", () => {

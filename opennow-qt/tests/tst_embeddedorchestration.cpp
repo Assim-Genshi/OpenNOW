@@ -10,6 +10,84 @@ QString source(const QString &relativePath)
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) return {};
     return QString::fromUtf8(file.readAll());
 }
+
+bool prepareLaunchGuards(QJSEngine &engine)
+{
+    if (engine.evaluate(QStringLiteral(R"JS(
+        var launchInspectRequestId='', launchInspectStage='', directLookupRequestId='', authGeneration=0;
+        var catalogOwner={selectedIdentity:'selection',actionGeneration:0,requestContextKey:'',mutationBusy:false,authScope:{generation:0}};
+        var signedIn=true;
+        var desktopUiActive=false, queueLaunchWaitingForSubscription=false;
+        var remoteSessionsRequestId='', streamerPrepareRequestId='';
+        var coreSessionRestoreId='', sessionStopIntentId='';
+        var queueSelector={opened:false,begin:function(title){return false}};
+    )JS")).isError()) return false;
+    const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
+    for (const auto &name : {"launchIntentCurrent", "inspectLaunch", "invalidateLaunchInspection",
+             "continueInspectedLaunch", "discoverPendingLaunch"}) {
+        const auto match = QRegularExpression(QStringLiteral(
+            "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
+            QRegularExpression::DotMatchesEverythingOption).match(shell);
+        if (!match.hasMatch() || engine.evaluate(match.captured()).isError()) return false;
+    }
+    return true;
+}
+
+bool loadShellFunction(QJSEngine &engine, const QString &name, int indentation = 4)
+{
+    const auto prefix = QString(indentation, u' ');
+    const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
+    const auto match = QRegularExpression(prefix + QStringLiteral("function %1\\([^\\n]*\\) \\{\\n.*?\\n").arg(name)
+        + prefix + u'}', QRegularExpression::DotMatchesEverythingOption)
+        .match(indentation == 8 ? shell.section(QStringLiteral("property Connections coreConnections:"), 1) : shell);
+    if (!match.hasMatch()) return false;
+    const auto result = engine.evaluate(match.captured());
+    if (result.isError()) qWarning().noquote() << result.toString();
+    return !result.isError();
+}
+
+bool prepareAuthentication(QJSEngine &engine)
+{
+    const auto setup = engine.evaluate(QStringLiteral(R"JS(
+        var root = this, ready = true, providersRequestId = '', providerRetryAttempts = 0;
+        var providers = [{idpId:'alliance',displayName:'Alliance'}], selectedProviderIdpId = 'alliance';
+        var providerDiscoveryDegraded = false, authGeneration = 0, authSessionRequestId = '';
+        var accountsRequestId = '', savedAccounts = [], authRestorePending = false, activeSession = null, streamBusy = false;
+        var coreSessionRestoreId = '', sessionStopIntentId = '';
+        var authSession = {user:{userId:'old',displayName:'Old'},provider:{idpId:'alliance'}};
+        Object.defineProperty(root, 'signedIn', {get: function() { return authSession !== null; }});
+        var addingAccount = false, authState = 'signed-in', authMessage = '', accountMessage = '';
+        var accountSwitchRequestId = '', accountRemoveRequestId = '', logoutAllRequestId = '';
+        var deviceStartRequestId = '', devicePollRequestId = '', deviceCompleteRequestId = '';
+        var pendingStaySignedIn = true, authChallenge = null, sessionPersistence = 'secure-store';
+        var sessionPersistenceMessage = '', pinMessage = '', lastError = '', requests = [], cancelled = [];
+        var providerRetryTimer = {running:false,interval:31000,restarts:0,
+            restart:function() {this.running=true;this.restarts++;},stop:function() {this.running=false;}};
+        var devicePollTimer = {running:false,interval:1000,
+            restart:function() {this.running=true;},stop:function() {this.running=false;}};
+        var CoreClient = {request:function(method,params) {
+            requests.push({method:method,params:params});return 'request-' + requests.length;
+        },cancel:function(id) {cancelled.push(id);}};
+        var AppController = {route:'accounts',navigate:function(route) {this.route=route;}};
+        var settingsOwner = {acceptResponse:function() {return false;},acceptFailure:function() {return false;}};
+        var onboardingOwner = {acceptResponse:function() {return false;},acceptFailure:function() {return false;}};
+        function ownedSessionTermination() {return null;}
+        function finishArtworkRequest() {return false;}
+        function acceptAuthEnvelope() {return true;}
+        function reloadCatalogForSession() {}
+        function refreshAccountServices() {}
+        function resolveDirectLaunch() {}
+        function qsTr(text) {return text;}
+        String.prototype.arg = function(value) {return this.replace(/%[12]/,String(value));};
+    )JS"));
+    if (setup.isError()) return false;
+    for (const auto &name : {"refreshProviders", "scheduleProviderRetry", "beginAddAccount",
+             "startDeviceLogin", "cancelDeviceLogin", "switchAccount", "refreshSavedAccounts", "showSavedAccountSelection"}) {
+        if (!loadShellFunction(engine, QString::fromLatin1(name))) return false;
+    }
+    return loadShellFunction(engine, QStringLiteral("onResponseReceived"), 8)
+        && loadShellFunction(engine, QStringLiteral("onRequestFailed"), 8);
+}
 }
 
 class EmbeddedOrchestrationTest final : public QObject
@@ -17,6 +95,363 @@ class EmbeddedOrchestrationTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void localFilePersistenceWarnsAboutUnencryptedTokens()
+    {
+        const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
+        const auto match = QRegularExpression(QStringLiteral(
+            "    readonly property string sessionPersistenceMessage: (\\{.*?\\n    \\})"),
+            QRegularExpression::DotMatchesEverythingOption).match(shell);
+        QVERIFY(match.hasMatch());
+        QJSEngine engine;
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var sessionPersistence = 'local-file', authWarnings = [];
+            function qsTr(text) {return text;}
+        )JS")).isError());
+        QVERIFY(!engine.evaluate(QStringLiteral("function persistenceMessage() ") + match.captured(1)).isError());
+        const auto warning = QStringLiteral("Your session tokens are saved unencrypted on disk because the OS keychain is unavailable. Anyone who can read this file can access your account.");
+        QCOMPARE(engine.evaluate(QStringLiteral("persistenceMessage()")).toString(), warning);
+        QCOMPARE(engine.evaluate(QStringLiteral("authWarnings = ['cleanup pending']; persistenceMessage()")).toString(), warning);
+        QCOMPARE(engine.evaluate(QStringLiteral("authWarnings = []; sessionPersistence = 'secure-store'; persistenceMessage()")).toString(), QString());
+        QCOMPARE(engine.evaluate(QStringLiteral("sessionPersistence = 'memory-only'; persistenceMessage()")).toString(),
+            QStringLiteral("This session is memory-only and will not last after you quit."));
+        const auto signIn = source(QStringLiteral("qml/desktop/auth/DesktopSignInScreen.qml"));
+        QCOMPARE(signIn.count(QStringLiteral("OpenNOW prefers the OS keychain for saved session tokens. If it is unavailable, tokens are saved unencrypted on disk.")), 2);
+        QVERIFY(!signIn.contains(QStringLiteral("The refresh token is encrypted with the OS keychain.")));
+    }
+
+    void providerRpcFailureOffersBoundedAndManualRecovery()
+    {
+        QJSEngine engine;
+        QVERIFY(prepareAuthentication(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            providers = [];
+            refreshProviders();
+            onRequestFailed(providersRequestId,'deadline_exceeded','Provider lookup timed out');
+        )JS")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("providerDiscoveryDegraded && providerRetryTimer.running && providersRequestId === ''")).toBool());
+        for (int attempt = 1; attempt <= 3; ++attempt) {
+            QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+                providerRetryTimer.running = false;
+                providerRetryAttempts++;
+                refreshProviders();
+                onRequestFailed(providersRequestId,'network_error','Offline');
+            )JS")).isError());
+            QCOMPARE(engine.evaluate(QStringLiteral("providerRetryTimer.running")).toBool(), attempt < 3);
+        }
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 4);
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            refreshProviders(true);
+            var manualRequest = providersRequestId;
+            refreshProviders(true);
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 5);
+        QCOMPARE(engine.evaluate(QStringLiteral("providerRetryAttempts")).toInt(), 0);
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            onResponseReceived(manualRequest,{providers:[{idpId:'alliance'}],discovery:{state:'ready'}});
+        )JS")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("!providerDiscoveryDegraded && !providerRetryTimer.running")).toBool());
+        const auto desktop = source(QStringLiteral("qml/desktop/auth/DesktopSignInScreen.qml"));
+        const auto console = source(QStringLiteral("qml/screens/SignInScreen.qml"));
+        QVERIFY(desktop.contains(QStringLiteral("onClicked: ShellStore.refreshProviders(true)")));
+        QVERIFY(console.contains(QStringLiteral("onClicked: ShellStore.refreshProviders(true)")));
+    }
+
+    void failedDeviceLoginClearsTheChallengeAndCanRestart_data()
+    {
+        QTest::addColumn<QString>("phase");
+        for (const auto &phase : {"expired", "denied", "start-rpc", "poll-rpc", "complete-rpc"})
+            QTest::newRow(phase) << QString::fromLatin1(phase);
+    }
+
+    void failedDeviceLoginClearsTheChallengeAndCanRestart()
+    {
+        QFETCH(QString, phase);
+        QJSEngine engine;
+        QVERIFY(prepareAuthentication(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            authSession = null;
+            authChallenge = {attemptId:'expired-attempt',verificationUriComplete:'https://example.invalid/expired'};
+            authState = 'waiting';
+            devicePollTimer.running = true;
+        )JS")).isError());
+        QString failure;
+        if (phase.endsWith(QStringLiteral("-rpc"))) {
+            const auto field = phase == QStringLiteral("start-rpc") ? QStringLiteral("deviceStartRequestId")
+                : phase == QStringLiteral("poll-rpc") ? QStringLiteral("devicePollRequestId") : QStringLiteral("deviceCompleteRequestId");
+            failure = QStringLiteral("%1='failed'; onRequestFailed('failed','network_error','Login unavailable');").arg(field);
+        } else {
+            failure = QStringLiteral("devicePollRequestId='failed'; onResponseReceived('failed',{status:'%1',error:'Login unavailable'});").arg(phase);
+        }
+        const auto result = engine.evaluate(failure);
+        QVERIFY2(!result.isError(), qPrintable(result.toString()));
+        QVERIFY(engine.evaluate(QStringLiteral("authChallenge === null && authState === 'error' && !devicePollTimer.running")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("startDeviceLogin('alliance',false)")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[requests.length-1].method")).toString(), QStringLiteral("auth.device.start"));
+        QCOMPARE(engine.evaluate(QStringLiteral("authState")).toString(), QStringLiteral("starting"));
+        QVERIFY(!engine.evaluate(QStringLiteral("pendingStaySignedIn")).toBool());
+    }
+
+    void addingAnAccountFinishesWithoutSignedInChanging()
+    {
+        QJSEngine engine;
+        QVERIFY(prepareAuthentication(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral("beginAddAccount()")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("addingAccount && signedIn && authSession.user.userId === 'old' && AppController.route === 'sign-in'")).toBool());
+        const auto console = source(QStringLiteral("qml/screens/SignInScreen.qml"));
+        const auto connected = QRegularExpression(QStringLiteral("readonly property bool connected: ([^\\n]+)")).match(console);
+        QVERIFY(connected.hasMatch());
+        engine.globalObject().setProperty(QStringLiteral("ShellStore"), engine.globalObject());
+        QVERIFY(!engine.evaluate(connected.captured(1)).toBool());
+        const auto completion = engine.evaluate(QStringLiteral(R"JS(
+            deviceCompleteRequestId='complete';
+            onResponseReceived('complete',{session:{user:{userId:'new',displayName:'New'},provider:{idpId:'alliance'}},persistence:'secure-store'});
+        )JS"));
+        QVERIFY2(!completion.isError(), qPrintable(completion.toString()));
+        QVERIFY(engine.evaluate(QStringLiteral("signedIn && !addingAccount && authSession.user.userId === 'new'")).toBool());
+        QCOMPARE(engine.evaluate(QStringLiteral("AppController.route")).toString(), QStringLiteral("home"));
+        QVERIFY(source(QStringLiteral("qml/screens/AccountsScreen.qml")).contains(QStringLiteral("onClicked: ShellStore.beginAddAccount()")));
+    }
+
+    void cancellingAnAddedAccountReturnsToIdleInsteadOfWaiting()
+    {
+        QJSEngine engine;
+        QVERIFY(prepareAuthentication(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            beginAddAccount();
+            authChallenge = {attemptId:'add-attempt',verificationUriComplete:'https://example.invalid/add'};
+            authState = 'waiting';
+            authMessage = 'Scan the QR code';
+            devicePollTimer.running = true;
+            cancelDeviceLogin();
+        )JS")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("authChallenge === null && authState === 'idle' && authMessage === ''")).toBool());
+        QVERIFY(engine.evaluate(QStringLiteral("addingAccount && signedIn && authSession.user.userId === 'old'")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("devicePollTimer.running")).toBool());
+        const auto desktop = source(QStringLiteral("qml/desktop/auth/DesktopSignInScreen.qml"));
+        const auto waiting = QRegularExpression(QStringLiteral("readonly property bool waiting: ([^\\n]+)")).match(desktop);
+        QVERIFY(waiting.hasMatch());
+        engine.globalObject().setProperty(QStringLiteral("ShellStore"), engine.globalObject());
+        QVERIFY(!engine.evaluate(waiting.captured(1)).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("startDeviceLogin('alliance',false)")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[requests.length-1].method")).toString(), QStringLiteral("auth.device.start"));
+        QCOMPARE(engine.evaluate(QStringLiteral("authState")).toString(), QStringLiteral("starting"));
+    }
+
+    void accountSwitchFailureIsVisibleAndClearedOnRetry()
+    {
+        QJSEngine engine;
+        QVERIFY(prepareAuthentication(engine));
+        const auto failure = engine.evaluate(QStringLiteral(R"JS(
+            switchAccount('new','');
+            onRequestFailed(accountSwitchRequestId,'network_error','Cannot reach your provider');
+        )JS"));
+        QVERIFY2(!failure.isError(), qPrintable(failure.toString()));
+        QCOMPARE(engine.evaluate(QStringLiteral("accountMessage")).toString(), QStringLiteral("Cannot reach your provider"));
+        QCOMPARE(engine.evaluate(QStringLiteral("pinMessage")).toString(), QStringLiteral("Cannot reach your provider"));
+        QCOMPARE(engine.evaluate(QStringLiteral("authSession.user.userId")).toString(), QStringLiteral("old"));
+        QVERIFY(!engine.evaluate(QStringLiteral("switchAccount('new','')")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("accountMessage")).toString(), QString());
+        const auto accounts = source(QStringLiteral("qml/screens/AccountsScreen.qml"));
+        QVERIFY(accounts.contains(QStringLiteral("objectName: \"accountActionError\"")));
+        QVERIFY(accounts.contains(QStringLiteral("text: ShellStore.accountMessage")));
+    }
+
+    void exhaustedTransportNegotiationDoesNotReclaimTheSeat_data()
+    {
+        QTest::addColumn<QString>("code");
+        QTest::addColumn<bool>("terminal");
+        QTest::addColumn<bool>("recoveryPending");
+        QTest::newRow("missing-video-peer") << QStringLiteral("missing-video-peer") << true << false;
+        QTest::newRow("legacy-unsupported") << QStringLiteral("nvst-legacy-transport-unsupported") << true << false;
+        QTest::newRow("missing-video-peer-during-recovery") << QStringLiteral("missing-video-peer") << true << true;
+        QTest::newRow("legacy-unsupported-during-recovery") << QStringLiteral("nvst-legacy-transport-unsupported") << true << true;
+        QTest::newRow("transient-network") << QStringLiteral("network_error") << false << false;
+        QTest::newRow("unknown-error") << QStringLiteral("new_native_error") << false << false;
+    }
+
+    void exhaustedTransportNegotiationDoesNotReclaimTheSeat()
+    {
+        QFETCH(QString, code);
+        QFETCH(bool, terminal);
+        QFETCH(bool, recoveryPending);
+        QJSEngine engine;
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var root=this, activeSession={sessionId:'seat'},streamer={status:'starting'},runtimeStreamProfile={};
+            var streamInputStateKnown=true,streamReplayEnabled=false,mediaClipTargetRequestId='',streamClipRequestId='';
+            var streamRecordingActive=false,streamerStopExpected=false,sessionRecoveryPending=false,sessionRecoveryAwaitingAuth=false;
+            var streamState='starting',streamMessage='',sessionReconnectAttempts=0,maximumSessionReconnectAttempts=8;
+            var streamStopRequestId='',streamerRecoveryExhausted=false,lastError='',streamerRestartAttempts=0;
+            var recoveryDiscoveryRequestId='',sessionClaimRequestId='',streamerStopRequestId='',recoverySessionId='';
+            var sessionClaimIsRecovery=false,resumePollAttempts=0,resumePollDeadlineMs=0,ready=true;
+            var coreSessionRestoreId='',sessionStopIntentId='',streamPollFailureAttempts=0;
+            var NativeStreamRuntime={running:false},requests=[];
+            var CoreClient={cancel:function() {},request:function(method,params) {requests.push({method:method,params:params});return 'recovery';}};
+            var streamerRestartTimer={running:false,restart:function() {this.running=true;},stop:function() {this.running=false;}};
+            var streamPollTimer={stop:function() {}},streamerPrepareRequestId='',streamPollRequestId='';
+            function inspectStreamerOverlayRequest() {} function inspectStreamerScreenshotRequest() {}
+            function inspectStreamerRecordingRequest() {} function inspectStreamerShortcutAction() {}
+            function qsTr(text) {return text;}
+        )JS")).isError());
+        for (const auto &name : {"acceptStreamerSnapshot", "isRemoteSessionTermination", "cancelSessionRecovery",
+                 "scheduleSessionRecovery", "retryNativeStreamer", "recoverStreamingSession", "discoverRecoverySession",
+                 "sessionOwnerSignedIn"})
+            QVERIFY(loadShellFunction(engine, QString::fromLatin1(name)));
+        engine.globalObject().setProperty(QStringLiteral("failureCode"), code);
+        if (recoveryPending) {
+            QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+                sessionRecoveryPending=true; recoveryDiscoveryRequestId='old-discovery';
+                sessionClaimRequestId='old-claim'; streamerRestartTimer.running=true;
+            )JS")).isError());
+        }
+        const auto result = engine.evaluate(QStringLiteral(R"JS(
+            acceptStreamerSnapshot({status:'error',errorCode:failureCode,message:'Original transport failure'});
+            acceptStreamerSnapshot({status:'stopped',message:'Later stopped event'});
+        )JS"));
+        QVERIFY2(!result.isError(), qPrintable(result.toString()));
+        QCOMPARE(engine.evaluate(QStringLiteral("streamerRecoveryExhausted")).toBool(), terminal);
+        QCOMPARE(engine.evaluate(QStringLiteral("streamerRestartTimer.running")).toBool(), !terminal);
+        QCOMPARE(engine.evaluate(QStringLiteral("streamState")).toString(), terminal ? QStringLiteral("error") : QStringLiteral("reconnecting"));
+        QCOMPARE(engine.evaluate(QStringLiteral("streamMessage")).toString(), QStringLiteral("Original transport failure"));
+        QCOMPARE(engine.evaluate(QStringLiteral("activeSession.sessionId")).toString(), QStringLiteral("seat"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 0);
+        if (terminal) {
+            QVERIFY(engine.evaluate(QStringLiteral("!sessionRecoveryPending && recoveryDiscoveryRequestId === '' && sessionClaimRequestId === ''")).toBool());
+        }
+        QVERIFY(!engine.evaluate(QStringLiteral("retryNativeStreamer()")).isError());
+        QVERIFY(!engine.evaluate(QStringLiteral("streamerRecoveryExhausted")).toBool());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[0].method")).toString(), QStringLiteral("session.poll"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[0].params.sessionId")).toString(), QStringLiteral("seat"));
+    }
+
+    void allianceAccountInvalidationRejectsOldRegionsAndKeepsProviderPreferences()
+    {
+        const auto account = source(QStringLiteral("qml/state/account/AccountServicesState.qml"));
+        const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
+        QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
+        for (const auto &name : {"invalidateAccount", "acceptRegions"}) {
+            const auto match = QRegularExpression(QStringLiteral(
+                "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
+                QRegularExpression::DotMatchesEverythingOption).match(account);
+            QVERIFY(match.hasMatch());
+            QVERIFY(!engine.evaluate(match.captured()).isError());
+        }
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var root = this, cancelled = [], mediaOwner = {id:'same-native-runtime'};
+            var accountLinkPollTimer = {stop: function() {}}, coreClient = {cancel: function(id) {cancelled.push(id)}};
+            var syncPollTimer = {stop: function() {}}, syncStatusRequestId = 'old-sync-status', syncCancelRequestId = 'old-sync-cancel';
+            var syncOperation = {operationId:'old-sync'}, storeSubscriptions = [{id:'old-subscription'}], catalogDefinitions = {};
+            var subscriptionRequestId = 'old-subscription', regionsRequestId = 'old-regions', regionPingRequestId = 'old-ping';
+            var gameAccountsRequestId = 'old-accounts', gameAccountActionRequestId = 'old-action', accountLinkStartRequestId = 'old-link';
+            var accountLinkPollRequestId = 'old-link-poll', storageLocationsRequestId = 'old-storage', storageResetRequestId = 'old-reset';
+            var subscription = {membershipTier:'old'}, regions = [{name:'old'}], regionsVpcId = 'old-vpc';
+            var regionPingPending = true, regionPingResults = {}, regionPingMessage = '', gameAccounts = [], gameAccountsState = 'loading';
+            var gameAccountMessage = '', accountLinkAttempt = {}, storageLocations = [], storageMessage = '';
+            invalidateAccount();
+            if (regionsRequestId === 'old-regions') acceptRegions({regions:[{name:'wrong-account'}],vpcId:'wrong-vpc'});
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("cancelled.length")).toInt(), 11);
+        QVERIFY(engine.evaluate(QStringLiteral("syncOperation === null && syncStatusRequestId === '' && syncCancelRequestId === '' && storeSubscriptions.length === 0")).toBool());
+        QCOMPARE(engine.evaluate(QStringLiteral("regions.length")).toInt(), 0);
+        QCOMPARE(engine.evaluate(QStringLiteral("regionsVpcId")).toString(), QString());
+        QCOMPARE(engine.evaluate(QStringLiteral("subscriptionRequestId")).toString(), QString());
+        QCOMPARE(engine.evaluate(QStringLiteral("mediaOwner.id")).toString(), QStringLiteral("same-native-runtime"));
+        QVERIFY(!engine.evaluate(QStringLiteral("regionsRequestId='new-regions'; if (regionsRequestId==='new-regions') acceptRegions({regions:[{name:'Alliance region'}],vpcId:'alliance-vpc'})")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("regions[0].name")).toString(), QStringLiteral("Alliance region"));
+        QVERIFY(shell.contains(QStringLiteral("requestId === root.regionsRequestId")));
+        const auto settings = source(QStringLiteral("qml/state/settings/SettingsState.qml"));
+        const auto selected = QRegularExpression(QStringLiteral("readonly property string selectedRegion: (\\{.*?\\n    \\})"),
+            QRegularExpression::DotMatchesEverythingOption).match(settings);
+        QVERIFY(selected.hasMatch());
+        QVERIFY(!engine.evaluate(QStringLiteral("function selectedRegion() ") + selected.captured(1)).isError());
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var settings = {region:'old-nvidia',regionProviderIdpId:'nvidia',providerRegions:{alliance:'saved-alliance'}};
+            var providerIdpId='alliance', providerCode='ALLIANCE', settingWrites={};
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("selectedRegion()")).toString(), QStringLiteral("saved-alliance"));
+        QCOMPARE(engine.evaluate(QStringLiteral("providerIdpId='another'; selectedRegion()")).toString(), QString());
+        QCOMPARE(engine.evaluate(QStringLiteral("providerIdpId='alliance'; regions=[]; selectedRegion()")).toString(), QStringLiteral("saved-alliance"));
+        for (const auto &name : {"matchesAuthScope", "acceptsSessionScope"}) {
+            const auto match = QRegularExpression(QStringLiteral(
+                "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
+                QRegularExpression::DotMatchesEverythingOption).match(shell);
+            QVERIFY(match.hasMatch());
+            QVERIFY(!engine.evaluate(match.captured()).isError());
+        }
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var authGeneration=2, authSession={user:{userId:'b'},provider:{idpId:'alliance'}};
+            var oldScope={generation:1,userId:'a',providerIdpId:'nvidia'};
+            var activeSession={sessionId:'owned-seat',ownerScope:oldScope};
+        )JS")).isError());
+        QVERIFY(!engine.evaluate(QStringLiteral("matchesAuthScope(oldScope)")).toBool());
+        QVERIFY(engine.evaluate(QStringLiteral("acceptsSessionScope(oldScope)")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("acceptsSessionScope({generation:1,userId:'different',providerIdpId:'nvidia'})")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("authSession={user:{userId:'a'},provider:{idpId:'nvidia'}}; acceptsSessionScope(oldScope)")).toBool());
+    }
+
+    void authenticationEnvelopeRejectsOlderAccountsAndCancelsEveryLoginPhase()
+    {
+        const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
+        QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
+        for (const auto &name : {"acceptAuthEnvelope", "cancelDeviceLogin", "pollDeviceLogin", "invalidateStoreLaunch",
+                 "cancelSessionRecovery", "sessionOwnerSignedIn"}) {
+            const auto match = QRegularExpression(QStringLiteral(
+                "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
+                QRegularExpression::DotMatchesEverythingOption).match(shell);
+            QVERIFY(match.hasMatch());
+            QVERIFY(!engine.evaluate(match.captured()).isError());
+        }
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var authGeneration = 4, authSession = null, sessionPersistence = 'none', authWarnings = [];
+            var root = this, activeSession = null, remoteSessions = [], pendingLaunchParams = null, conflictSession = null;
+            var remoteSessionsRequestId = '', remoteSessionDiscoveryRequestId = '', sessionClaimRequestId = '', streamCreateRequestId = '', streamerPrepareRequestId = '';
+            var recoveryDiscoveryRequestId = '', sessionClaimIsRecovery = false, sessionRecoveryPending = false;
+            var sessionRecoveryAwaitingAuth = false, recoverySessionId = '', resumePollAttempts = 0, resumePollDeadlineMs = 0;
+            var streamerRestartTimer = {stop: function() {}};
+            var accountServicesOwner = {invalidateAccount: function() {}}, Qt = {callLater: function() {}};
+            var storeLaunchRequestId = '', storeLaunchTarget = null, storeLaunchFailed = false,
+                storeLaunchDecision = {status: 'metadata_unconfirmed', message: ''};
+            function reloadCatalogForSession() {} function refreshAccountServices() {}
+            var ready = true, signedIn = false, authState = 'waiting', authSessionRequestId = '';
+            var deviceStartRequestId = 'start', devicePollRequestId = 'poll', deviceCompleteRequestId = 'complete';
+            var authChallenge = {attemptId: 'attempt'}, cancelled = [], requests = [];
+            var devicePollTimer = {stop: function() {}};
+            var CoreClient = {cancel: function(id) { cancelled.push(id) }, request: function(method, params) {
+                requests.push({method: method, params: params}); return 'reconcile';
+            }};
+        )JS")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("acceptAuthEnvelope({generation:5,session:{user:{userId:'new'},provider:{code:'NVIDIA'}},persistence:'secure-store'})")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("acceptAuthEnvelope({generation:4,session:null})")).toBool());
+        QCOMPARE(engine.evaluate(QStringLiteral("authSession.user.userId")).toString(), QStringLiteral("new"));
+        QVERIFY(!engine.evaluate(QStringLiteral("cancelDeviceLogin()")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("cancelled.join(',')")).toString(), QStringLiteral("start,complete,poll"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[0].method")).toString(), QStringLiteral("auth.session.get"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[1].method")).toString(), QStringLiteral("auth.device.cancel"));
+        QVERIFY(!engine.evaluate(QStringLiteral("authChallenge={attemptId:'new'}; pollDeviceLogin()")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("Object.keys(requests[2].params).join(',')")).toString(), QStringLiteral("attemptId"));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            activeSession={ownerScope:{generation:6,userId:'new',providerIdpId:'alliance'}};
+            streamerPrepareRequestId='current-owner-prepare';
+            acceptAuthEnvelope({generation:6,session:{user:{userId:'new'},provider:{idpId:'alliance'}}});
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("streamerPrepareRequestId")).toString(), QStringLiteral("current-owner-prepare"));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            storeLaunchRequestId='store-launch-in-flight';
+            storeLaunchTarget={appId:'previous-account'};
+            storeLaunchFailed=true;
+            acceptAuthEnvelope({generation:7,session:{user:{userId:'other'},provider:{idpId:'alliance'}}});
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("storeLaunchRequestId")).toString(), QString());
+        QVERIFY(engine.evaluate(QStringLiteral("storeLaunchTarget === null")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("storeLaunchFailed")).toBool());
+        QVERIFY(engine.evaluate(QStringLiteral("cancelled.indexOf('store-launch-in-flight') >= 0")).toBool());
+        QCOMPARE(engine.evaluate(QStringLiteral("streamerPrepareRequestId")).toString(), QString());
+        QVERIFY(!shell.contains(QStringLiteral("deviceCode")));
+        const auto timer = shell.section(QStringLiteral("property Timer devicePollTimer:"), 1).section(QStringLiteral("property Timer streamPollTimer:"), 0, 0);
+        QVERIFY(timer.contains(QStringLiteral("repeat: false")));
+    }
+
     void desktopStoreSelectionUsesTheSelectedLaunchVariant()
     {
         const auto desktop = source(QStringLiteral("qml/desktop/shell/DesktopApp.qml"));
@@ -24,8 +459,9 @@ private slots:
         const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
         const auto catalog = source(QStringLiteral("qml/state/catalog/CatalogState.qml"));
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         engine.installExtensions(QJSEngine::TranslationExtension);
-        for (const auto &name : {"selectGameVariant", "selectedLaunchAppId", "selectedGameMembershipError", "launchSelectedGame"}) {
+        for (const auto &name : {"selectGameVariant", "selectedLaunchAppId", "launchSelectedGame"}) {
             const auto match = QRegularExpression(QStringLiteral(
                 "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
                 QRegularExpression::DotMatchesEverythingOption).match(
@@ -35,10 +471,11 @@ private slots:
         }
         QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
             var signedIn = true, ready = true, streamBusy = false, onboardingReplaying = false;
-            var selectedGame = {launchAppId: '1001', title: 'Multi Store Game', selectedVariantIndex: 0,
+            var selectedGame = {id:'parent',launchAppId: '1001', title: 'Multi Store Game', selectedVariantIndex: 0,
                 variants: [{id: '1001', store: 'Steam', inLibrary: false},
                            {id: '1003', store: 'Xbox', inLibrary: true}]};
-            var settings = {}, regions = [], requests = [], pendingLaunchParams = null;
+            var settings = {}, selectedRegion = '', regions = [], requests = [], pendingLaunchParams = null;
+            var storeLaunchTarget = null;
             var CoreClient = {request: function(method, params) {
                 requests.push({method: method, params: params}); return 'request';
             }};
@@ -47,11 +484,19 @@ private slots:
             selectGameVariant(1);
             launchSelectedGame(false);
         )JS")).isError());
-        QCOMPARE(engine.evaluate(QStringLiteral("requests[0].params.appId")).toString(), QStringLiteral("1003"));
-        QVERIFY(engine.evaluate(QStringLiteral("requests[0].params.accountLinked")).toBool());
-        QVERIFY(!engine.evaluate(QStringLiteral("selectGameVariant(0); launchSelectedGame(false);")).isError());
-        QCOMPARE(engine.evaluate(QStringLiteral("requests[1].params.appId")).toString(), QStringLiteral("1001"));
-        QVERIFY(!engine.evaluate(QStringLiteral("requests[1].params.accountLinked")).toBool());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[0].method")).toString(), QStringLiteral("catalog.launch.inspect"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[0].params.variantId")).toString(), QStringLiteral("1003"));
+        QVERIFY(engine.evaluate(QStringLiteral("pendingLaunchParams.accountLinked")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("launchInspectRequestId=''; selectGameVariant(0); launchSelectedGame(false);")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[1].method")).toString(), QStringLiteral("catalog.launch.inspect"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[1].params.variantId")).toString(), QStringLiteral("1001"));
+        QVERIFY(!engine.evaluate(QStringLiteral("pendingLaunchParams.accountLinked")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral(
+            "launchInspectRequestId=''; storeLaunchTarget={appId:'parent',variantId:'1001'}; launchSelectedGame(false);")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("requests[2].params.storeLaunch")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral(
+            "launchInspectRequestId=''; pendingLaunchParams=null; storeLaunchTarget={appId:'parent',variantId:'1003'}; selectGameVariant(0); launchSelectedGame(false);")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("requests[3].params.storeLaunch")).isUndefined());
     }
 
     void existingSessionLaunchFlow_data()
@@ -61,7 +506,7 @@ private slots:
         QTest::addColumn<QString>("expectedState");
         QTest::addColumn<QString>("expectedMethod");
         QTest::newRow("new-game") << QStringLiteral("[]") << false
-            << QStringLiteral("requesting") << QStringLiteral("session.create");
+            << QStringLiteral("requesting") << QStringLiteral("catalog.launch.inspect");
         QTest::newRow("same-game") << QStringLiteral(R"([{sessionId:'same',appId:'123',streamingBaseUrl:'https://region'}])") << false
             << QStringLiteral("resuming") << QStringLiteral("session.claim");
         QTest::newRow("same-game-after-conflict") << QStringLiteral(R"([{sessionId:'same',appId:123,streamingBaseUrl:'https://region'}])") << true
@@ -84,6 +529,7 @@ private slots:
         QFETCH(QString, expectedMethod);
         const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         engine.installExtensions(QJSEngine::TranslationExtension);
         for (const auto &name : {"inspectRemoteSessions", "resolveSessionConflict", "createPendingSession",
                                  "checkLaunchSessions", "handleSessionCreateFailure", "retrySessionLaunch"}) {
@@ -97,7 +543,7 @@ private slots:
             var ready = true, streamBusy = false, onboardingReplaying = false;
             var nativeRuntimeReady = true, nativeRuntimeCapabilities = {};
             var streamCreateRequestId = '', remoteSessionsRequestId = '', sessionClaimRequestId = '';
-            var pendingLaunchParams = {appId:'123',title:'Selected game'};
+            var pendingLaunchParams = {appId:'123',title:'Selected game',catalogAppId:'parent',variantId:'123',selectionIdentity:'selection',authGeneration:0,actionGeneration:0,requestContextKey:''};
             var conflictSession = null, activeSession = null, remoteSessions = [], streamState = 'checking', streamMessage = '';
             var conflictSessionNeedsRefresh = false;
             var requests = [], overlays = [], created = 0, pollStops = 0;
@@ -124,11 +570,11 @@ private slots:
         } else if (expectedState == QStringLiteral("conflict")) {
             QCOMPARE(engine.evaluate(QStringLiteral("overlays[0]")).toString(), QStringLiteral("session-conflict"));
             QVERIFY(!engine.evaluate(QStringLiteral("resolveSessionConflict('new')")).isError());
-            QCOMPARE(engine.evaluate(QStringLiteral("requests[0].method")).toString(), QStringLiteral("session.stop"));
-            QVERIFY(engine.evaluate(QStringLiteral("forceNewAfterStop")).toBool());
+            QCOMPARE(engine.evaluate(QStringLiteral("requests[0].method")).toString(), QStringLiteral("catalog.launch.inspect"));
+            QCOMPARE(engine.evaluate(QStringLiteral("launchInspectStage")).toString(), QStringLiteral("stop"));
         } else if (conflictDetected) {
             QVERIFY(!engine.evaluate(QStringLiteral("retrySessionLaunch()")).isError());
-            QCOMPARE(engine.evaluate(QStringLiteral("requests[0].method")).toString(), QStringLiteral("session.remote.list"));
+            QCOMPARE(engine.evaluate(QStringLiteral("requests[0].method")).toString(), QStringLiteral("catalog.launch.inspect"));
             QVERIFY(!engine.evaluate(QStringLiteral("inspectRemoteSessions({sessions:[]})")).isError());
             QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 1);
         }
@@ -138,6 +584,7 @@ private slots:
     {
         const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         engine.installExtensions(QJSEngine::TranslationExtension);
         for (const auto &name : {"handleSessionCreateFailure", "checkLaunchSessions"}) {
             const auto match = QRegularExpression(QStringLiteral(
@@ -147,13 +594,13 @@ private slots:
             QVERIFY(!engine.evaluate(match.captured()).isError());
         }
         QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
-            var ready = true, streamBusy = false, pendingLaunchParams = {appId:'123'};
+            var ready = true, streamBusy = false, pendingLaunchParams = {appId:'123',catalogAppId:'parent',variantId:'123',selectionIdentity:'selection',authGeneration:0,actionGeneration:0,requestContextKey:''};
             var launchConflictDetected = false, requests = [], streamState = 'requesting', streamMessage = '';
             var streamPollTimer = {stop:function(){}};
             var CoreClient = {request:function(method,params){requests.push(method);return 'discovery';}};
             handleSessionCreateFailure('session_conflict','SESSION_LIMIT_PER_DEVICE_EXCEEDED_STATUS');
         )JS")).isError());
-        QCOMPARE(engine.evaluate(QStringLiteral("requests.join(',')")).toString(), QStringLiteral("session.remote.list"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.join(',')")).toString(), QStringLiteral("catalog.launch.inspect"));
         QCOMPARE(engine.evaluate(QStringLiteral("streamState")).toString(), QStringLiteral("checking"));
         QVERIFY(engine.evaluate(QStringLiteral("launchConflictDetected")).toBool());
         QVERIFY(!engine.evaluate(QStringLiteral("handleSessionCreateFailure('unauthorized','Sign in again')")).isError());
@@ -165,6 +612,7 @@ private slots:
     {
         const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         engine.installExtensions(QJSEngine::TranslationExtension);
         for (const auto &name : {"stopStreamingSession", "inspectRemoteSessions"}) {
             const auto match = QRegularExpression(QStringLiteral(
@@ -196,6 +644,193 @@ private slots:
         QVERIFY(engine.evaluate(QStringLiteral("pendingLaunchParams === null && conflictSession === null && !forceNewAfterStop")).toBool());
     }
 
+    void cancelledMediaPreparationCannotStartOrRecover()
+    {
+        QJSEngine engine;
+        QVERIFY(prepareAuthentication(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var remoteSessionsRequestId = '', streamCreateRequestId = '', streamPollRequestId = '';
+            var streamerPrepareRequestId = 'prepare', streamerStopRequestId = '', streamStopRequestId = '';
+            var activeSession = {sessionId:'seat'}, streamStartedAtMs = 0, streamState = 'starting';
+            var streamer = {status:'starting'}, nativeCommands = [], snapshots = 0;
+            var negotiatedStreamProfile = {};
+            var streamPollTimer = {stop:function(){}}, streamerRestartTimer = {stop:function(){}};
+            function invalidateLaunchInspection() {}
+            function cancelSessionRecovery() {}
+            function acceptStreamerSnapshot() {snapshots++;}
+            function prepareMicrophoneStart() {return false;}
+            function sendNativeCommand(type) {nativeCommands.push(type); return 'native-' + type;}
+            CoreClient.cancel = function(id) {
+                if (streamerPrepareRequestId !== '') throw Error('prepare still owned during cancellation');
+                cancelled.push(id);
+                onRequestFailed(id, 'cancelled', 'Cancelled');
+            };
+        )JS")).isError());
+        QVERIFY(loadShellFunction(engine, QStringLiteral("stopStreamingSession")));
+        QVERIFY(loadShellFunction(engine, QStringLiteral("stopNativeStreamer")));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            stopStreamingSession();
+            onResponseReceived('prepare', {context:{settings:{}},session:{sessionId:'seat'}});
+            onRequestFailed('prepare', 'network_error', 'Late failure');
+            activeSession = null;
+            onResponseReceived('prepare', {context:{settings:{}},session:{sessionId:'seat'}});
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("cancelled.join(',')")).toString(), QStringLiteral("prepare"));
+        QCOMPARE(engine.evaluate(QStringLiteral("nativeCommands.join(',')")).toString(), QStringLiteral("stop"));
+        QCOMPARE(engine.evaluate(QStringLiteral("snapshots")).toInt(), 0);
+        QVERIFY(engine.evaluate(QStringLiteral("streamStopRequestId !== ''")).toBool());
+    }
+
+    void preparedMediaRequiresCurrentLiveSession_data()
+    {
+        QTest::addColumn<QString>("transition");
+        QTest::addColumn<bool>("starts");
+        QTest::newRow("current") << QString() << true;
+        QTest::newRow("ended") << QStringLiteral("activeSession = null;") << false;
+        QTest::newRow("replaced") << QStringLiteral("activeSession = {sessionId:'new-seat'};") << false;
+        QTest::newRow("cloud-stop") << QStringLiteral("streamStopRequestId = 'cloud-stop';") << false;
+        QTest::newRow("native-stop") << QStringLiteral("streamerStopRequestId = 'native-stop';") << false;
+        QTest::newRow("recovery") << QStringLiteral("sessionRecoveryPending = true;") << false;
+        QTest::newRow("core-offline") << QStringLiteral("ready = false;") << false;
+    }
+
+    void preparedMediaRequiresCurrentLiveSession()
+    {
+        QFETCH(QString, transition);
+        QFETCH(bool, starts);
+        QJSEngine engine;
+        QVERIFY(prepareAuthentication(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var streamerPrepareRequestId = 'prepare', streamerStopRequestId = '', streamStopRequestId = '';
+            var activeSession = {sessionId:'seat'}, sessionRecoveryPending = false, snapshots = 0;
+            var negotiatedStreamProfile = {}, nativeCommands = [];
+            function prepareMicrophoneStart() {return false;}
+            function acceptStreamerSnapshot() {snapshots++;}
+            function sendNativeCommand(type) {nativeCommands.push(type); return type;}
+        )JS")).isError());
+        QVERIFY(!engine.evaluate(transition).isError());
+        const auto result = engine.evaluate(QStringLiteral(
+            "onResponseReceived('prepare', {context:{settings:{}},session:{sessionId:'seat'}});"));
+        QVERIFY2(!result.isError(), qPrintable(result.toString()));
+        QCOMPARE(engine.evaluate(QStringLiteral("nativeCommands.length")).toInt(), starts ? 1 : 0);
+        QCOMPARE(engine.evaluate(QStringLiteral("snapshots")).toInt(), starts ? 1 : 0);
+        QCOMPARE(engine.evaluate(QStringLiteral("streamerPrepareRequestId")).toString(), QString());
+    }
+
+    void stoppingCloudSessionCannotPrepareMediaAgain()
+    {
+        QJSEngine engine;
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var ready = true, activeSession = {sessionId:'seat'}, sessionRecoveryPending = false, sessionRecoveryAwaitingAuth = false;
+            var coreSessionRestoreId = '', sessionStopIntentId = '';
+            var streamStopRequestId = 'cloud-stop', streamerStopRequestId = '', streamerStartRequestId = '';
+            var streamerPrepareRequestId = '', sessionClaimRequestId = '', streamerRecoveryExhausted = false;
+            var streamerRestartTimer = {running:false}, streamer = null, nativeRuntimeReady = true;
+            var nativeRuntimeCapabilities = {}, prepares = 0;
+            var CoreClient = {request:function(){prepares++; return 'prepare';}};
+        )JS")).isError());
+        QVERIFY(loadShellFunction(engine, QStringLiteral("startNativeStreamer")));
+        const auto result = engine.evaluate(QStringLiteral("startNativeStreamer();"));
+        QVERIFY2(!result.isError(), qPrintable(result.toString()));
+        QCOMPARE(engine.evaluate(QStringLiteral("streamerPrepareRequestId")).toString(), QString());
+        QCOMPARE(engine.evaluate(QStringLiteral("prepares")).toInt(), 0);
+    }
+
+    void invalidPreparedMediaStillReportsFailure()
+    {
+        for (const auto &response : {"{}", "{session:{sessionId:'seat'}}", "{context:{settings:{}}}"}) {
+            QJSEngine engine;
+            QVERIFY(prepareAuthentication(engine));
+            QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+                var streamerPrepareRequestId = 'prepare', streamerStopRequestId = '', streamStopRequestId = '';
+                var activeSession = {sessionId:'seat'}, sessionRecoveryPending = false, failure = '';
+                function acceptStreamerSnapshot(snapshot) {failure = snapshot.errorCode;}
+            )JS")).isError());
+            const auto result = engine.evaluate(QStringLiteral("onResponseReceived('prepare', %1);")
+                .arg(QString::fromLatin1(response)));
+            QVERIFY2(!result.isError(), qPrintable(result.toString()));
+            QCOMPARE(engine.evaluate(QStringLiteral("failure")).toString(), QStringLiteral("invalid_stream_context"));
+        }
+    }
+
+    void storePresentationRestartsAfterContextReset_data()
+    {
+        QTest::addColumn<int>("completedSections");
+        QTest::newRow("marquee-loaded") << 1;
+        QTest::newRow("panels-loaded") << 2;
+        QTest::newRow("all-loaded") << 3;
+    }
+
+    void storePresentationRestartsAfterContextReset()
+    {
+        QFETCH(int, completedSections);
+        QJSEngine engine;
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var root = this, ready = true, storeSource = 'store-browse';
+            var storePresentationIndex = 0, storePresentationRequestId = 'old-presentation';
+            var storeRequestId = '', storeShelfCache = [], storeShelfEpoch = 0;
+            var storePageTimer = {stop:function(){}}, requests = [], cancelled = [];
+            var coreClient = {cancel:function(id) {
+                if (storePresentationRequestId !== '') throw Error('old presentation still owned');
+                cancelled.push(id);
+            }, request:function(method, params) {requests.push(params.section); return params.section;}};
+            function storeSessionReset() {}
+        )JS")).isError());
+        engine.globalObject().setProperty(QStringLiteral("storePresentationIndex"), completedSections);
+        const auto catalog = source(QStringLiteral("qml/state/catalog/CatalogState.qml"));
+        for (const auto &name : {"reloadStoreForSession", "resetStoreShelves", "cancelStoreRequests",
+                 "requestStorePresentation", "acceptStorePresentation"}) {
+            const auto match = QRegularExpression(QStringLiteral(
+                "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
+                QRegularExpression::DotMatchesEverythingOption).match(catalog);
+            QVERIFY(match.hasMatch());
+            QVERIFY(!engine.evaluate(match.captured()).isError());
+        }
+        const auto result = engine.evaluate(QStringLiteral(R"JS(
+            reloadStoreForSession();
+            requestStorePresentation();
+            acceptStorePresentation({section:'marquee', items:[{title:'New account'}]});
+            acceptStorePresentation({section:'panels', items:[{title:'New shelves'}]});
+            acceptStorePresentation({section:'filters', items:[{title:'New filters'}]});
+        )JS"));
+        QVERIFY2(!result.isError(), qPrintable(result.toString()));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.join(',')")).toString(), QStringLiteral("marquee,panels,filters"));
+        QCOMPARE(engine.evaluate(QStringLiteral("cancelled.join(',')")).toString(), QStringLiteral("old-presentation"));
+        QCOMPARE(engine.evaluate(QStringLiteral("storePresentationIndex")).toInt(), 3);
+        QCOMPARE(engine.evaluate(QStringLiteral("storeMarquee[0].title")).toString(), QStringLiteral("New account"));
+        QCOMPARE(engine.evaluate(QStringLiteral("storePanels[0].title")).toString(), QStringLiteral("New shelves"));
+        QCOMPARE(engine.evaluate(QStringLiteral("storeFilterGroups[0].title")).toString(), QStringLiteral("New filters"));
+    }
+
+    void consoleDestructiveControlsRequireConfirmation()
+    {
+        QJSEngine engine;
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var root = this, stops = 0;
+            var AppController = {route:'stream', overlay:'guide-session', showOverlay:function(value){this.overlay=value;}};
+            function stopStreamingSession() {stops++;}
+            function qsTr(value) {return value;}
+            var ShellStore = root;
+        )JS")).isError());
+        QVERIFY(loadShellFunction(engine, QStringLiteral("requestStreamExitConfirmation")));
+        const auto guide = source(QStringLiteral("qml/overlays/GuideOverlay.qml"));
+        const auto activate = QRegularExpression(QStringLiteral("    function activate\\(action\\) \\{.*?\\n    \\}"),
+            QRegularExpression::DotMatchesEverythingOption).match(guide);
+        QVERIFY(activate.hasMatch());
+        QVERIFY(!engine.evaluate(activate.captured()).isError());
+        QVERIFY(!engine.evaluate(QStringLiteral("activate('end');")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("stops")).toInt(), 0);
+        QCOMPARE(engine.evaluate(QStringLiteral("AppController.overlay")).toString(), QStringLiteral("desktop-stream-exit-confirm"));
+
+        const auto screen = source(QStringLiteral("qml/screens/StreamScreen.qml"));
+        const auto clicked = QRegularExpression(QStringLiteral(
+            "text: qsTr\\(\"Stop session\"\\);[^\\n]*?onClicked: ([^;]+);")).match(screen);
+        QVERIFY(clicked.hasMatch());
+        QVERIFY(!engine.evaluate(QStringLiteral("AppController.overlay = ''; ") + clicked.captured(1)).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("stops")).toInt(), 0);
+        QCOMPARE(engine.evaluate(QStringLiteral("AppController.overlay")).toString(), QStringLiteral("desktop-stream-exit-confirm"));
+    }
+
     void dismissingSessionConflictPreservesTheRunningGame()
     {
         const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
@@ -210,6 +845,7 @@ private slots:
         QVERIFY(keyHandler.hasMatch());
         for (const int key : {Qt::Key_Escape, Qt::Key_Back}) {
             QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
             engine.installExtensions(QJSEngine::TranslationExtension);
             QVERIFY(!engine.evaluate(resolve.captured()).isError());
             QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
@@ -234,8 +870,9 @@ private slots:
     {
         const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         engine.installExtensions(QJSEngine::TranslationExtension);
-        for (const auto &name : {"refreshAccountServices", "refreshRemoteSessions", "launchSelectedGame"}) {
+        for (const auto &name : {"refreshSavedAccounts", "refreshAccountServices", "refreshRemoteSessions", "launchSelectedGame"}) {
             const auto match = QRegularExpression(QStringLiteral(
                 "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
                 QRegularExpression::DotMatchesEverythingOption).match(shell);
@@ -247,7 +884,7 @@ private slots:
             QRegularExpression::DotMatchesEverythingOption).match(shell);
         const auto failed = QRegularExpression(QStringLiteral(
             "        function onRequestFailed\\([^\\n]*\\) \\{(.*?)\\n        \\}"),
-            QRegularExpression::DotMatchesEverythingOption).match(shell);
+            QRegularExpression::DotMatchesEverythingOption).match(shell.section(QStringLiteral("property Connections coreConnections:"), 1));
         QVERIFY(busy.hasMatch());
         QVERIFY(failed.hasMatch());
         QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
@@ -256,10 +893,12 @@ private slots:
             var streamCreateRequestId = '', streamStopRequestId = '', sessionClaimRequestId = '';
             var subscriptionRequestId = 'subscription', regionsRequestId = 'regions', accountsRequestId = 'accounts';
             var gameAccountsRequestId = 'connections', streamState = 'idle', streamMessage = '', lastError = '';
-            var requests = [], selectedGame = {title:'Game'}, settings = {}, regions = [], onboardingReplaying = false;
+            var requests = [], selectedGame = {title:'Game'}, settings = {}, selectedRegion = '', regions = [], onboardingReplaying = false;
+            var storeLaunchTarget = null;
             var CoreClient = {request:function(method,params){requests.push(method);return 'request-'+requests.length;}};
             var AppController = {navigate:function(){}};
             var onboardingOwner = {acceptFailure:function(){return false;}};
+            var settingsOwner = {acceptFailure:function(){return false;}};
             function finishArtworkRequest(){return false;}
             function selectedLaunchAppId(){return '123';}
             function selectedGameMembershipError(){return '';}
@@ -275,7 +914,8 @@ private slots:
         QCOMPARE(engine.evaluate(QStringLiteral("lastError")).toString(), QString());
         QVERIFY(!engine.evaluate(QStringLiteral("refreshAccountServices(); launchSelectedGame(false)")).isError());
         QCOMPARE(engine.evaluate(QStringLiteral("streamState")).toString(), QStringLiteral("checking"));
-        QCOMPARE(engine.evaluate(QStringLiteral("remoteSessionsRequestId")).toString(), QStringLiteral("request-3"));
+        QCOMPARE(engine.evaluate(QStringLiteral("launchInspectRequestId")).toString(), QStringLiteral("request-3"));
+        QCOMPARE(engine.evaluate(QStringLiteral("remoteSessionsRequestId")).toString(), QString());
         QVERIFY(engine.evaluate(QStringLiteral("streamBusy")).toBool());
     }
 
@@ -283,6 +923,7 @@ private slots:
     {
         const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         engine.installExtensions(QJSEngine::TranslationExtension);
         for (const auto &name : {"resolveSessionConflict", "inspectRemoteSessions"}) {
             const auto match = QRegularExpression(QStringLiteral(
@@ -323,6 +964,7 @@ private slots:
             QRegularExpression::DotMatchesEverythingOption).match(shell);
         QVERIFY(binding.hasMatch());
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         QVERIFY(!engine.evaluate(QStringLiteral("function selectedSession() {%1}")
                                      .arg(binding.captured(1))).isError());
         for (int status = 1; status <= 7; ++status) {
@@ -345,6 +987,7 @@ private slots:
     void updaterPollsManagedPendingWithoutRequiringAnotherApplicationRestart()
     {
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         QVERIFY(initializeUpdaterEngine(engine));
         QVERIFY(!engine.evaluate(QStringLiteral("acceptUpdaterState({status:'managed-pending',canCheck:false})")).isError());
         QVERIFY(engine.evaluate(QStringLiteral("updaterNeedsReconciliation")).toBool());
@@ -358,6 +1001,7 @@ private slots:
     void updaterFreshStartupPollsUntilHelperReportsItsOutcome()
     {
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         QVERIFY(initializeUpdaterEngine(engine));
         QVERIFY(!engine.evaluate(QStringLiteral("acceptUpdaterState({status:'restarting',canCheck:false})")).isError());
         QVERIFY(!engine.evaluate(QStringLiteral("updaterInstallConfirmed")).toBool());
@@ -370,6 +1014,7 @@ private slots:
     void updaterReconciliationPreservesRejectedOperationFeedback()
     {
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         QVERIFY(initializeUpdaterEngine(engine));
         QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
             reconcileUpdaterFailure('End your active session first');
@@ -388,6 +1033,7 @@ private slots:
     void updaterRequiresConsentAndAuthoritativeExit()
     {
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         QVERIFY(initializeUpdaterEngine(engine));
         QVERIFY(!engine.evaluate(QStringLiteral("installUpdate(); installUpdate(false)")).isError());
         QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 0);
@@ -425,6 +1071,7 @@ private slots:
     {
         QFETCH(QString, sessionState);
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         QVERIFY(initializeUpdaterEngine(engine));
         QVERIFY(!engine.evaluate(sessionState).isError());
         QVERIFY(!engine.evaluate(QStringLiteral("installUpdate(true); runAutomaticUpdates()")).isError());
@@ -436,6 +1083,7 @@ private slots:
     void updaterReconcilesTimeoutWithoutInventingCapabilities()
     {
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         QVERIFY(initializeUpdaterEngine(engine));
         QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
             installUpdate(true);
@@ -466,6 +1114,7 @@ private slots:
     void updaterBackgroundPreferencesAreIndependent()
     {
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         QVERIFY(initializeUpdaterEngine(engine));
         QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
             settings = {autoCheckForUpdates:false,autoDownloadUpdates:true};
@@ -491,6 +1140,74 @@ private slots:
             QVERIFY(screen.contains(QStringLiteral("onAccepted: ShellStore.installUpdate(true)")));
             QVERIFY(screen.contains(QStringLiteral("onClicked: installConfirmation.open()")));
         }
+    }
+
+    void updaterInstallationFailuresRemainVisibleAfterBackgroundChecks()
+    {
+        QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
+        QVERIFY(initializeUpdaterEngine(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            acceptUpdaterState({status:'failed',message:'Authorization failed',canCheck:true});
+            acceptUpdaterState({status:'checking',message:'Checking releases'});
+            acceptUpdaterState({status:'not-available',message:'Up to date',canCheck:true});
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("updaterFailureMessage")).toString(), QStringLiteral("Authorization failed"));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            updaterFailureMessage = '';
+            acceptUpdaterState({status:'rolled-back',message:'Previous version restored'});
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("updaterFailureMessage")).toString(), QStringLiteral("Previous version restored"));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            updaterFailureMessage = '';
+            acceptUpdaterState({status:'rolled-back',message:'Previous version restored'});
+            acceptUpdaterState({status:'error',message:'Network unavailable'});
+        )JS")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("updaterFailureMessage")).toString().isEmpty());
+    }
+
+    void updaterRetriesTransientDownloadsWithBoundedBackoff()
+    {
+        QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
+        QVERIFY(initializeUpdaterEngine(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var now = 1000000;
+            Date.now = function() { return now; };
+            settings = {autoCheckForUpdates:false,autoDownloadUpdates:true};
+            updaterState = {status:'available',canCheck:true,canDownload:true,availableVersion:'2'};
+            runAutomaticUpdates();
+            updaterDownloadRequestId = '';
+            runAutomaticUpdates();
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 1);
+        QVERIFY(!engine.evaluate(QStringLiteral("now += 60000; runAutomaticUpdates(); updaterDownloadRequestId = ''; runAutomaticUpdates();")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 2);
+        QVERIFY(!engine.evaluate(QStringLiteral("now += 60000; runAutomaticUpdates();")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 2);
+        QVERIFY(!engine.evaluate(QStringLiteral("now += 60000; runAutomaticUpdates(); updaterDownloadRequestId = ''; now += 21600000; runAutomaticUpdates();")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 3);
+        QVERIFY(!engine.evaluate(QStringLiteral("checkForUpdates(); updaterCheckRequestId = ''; runAutomaticUpdates();")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[3].method")).toString(), QStringLiteral("updater.check"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[4].method")).toString(), QStringLiteral("updater.download"));
+    }
+
+    void updaterRetriesFailedChecksBeforeTheNormalSixHourInterval()
+    {
+        QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
+        QVERIFY(initializeUpdaterEngine(engine));
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var now = 1000000;
+            Date.now = function() { return now; };
+            settings = {autoCheckForUpdates:true,autoDownloadUpdates:false};
+            updaterState = {status:'error',canCheck:true};
+            runAutomaticUpdates(); updaterCheckRequestId = '';
+            now += 60000; runAutomaticUpdates();
+        )JS")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 1);
+        QVERIFY(!engine.evaluate(QStringLiteral("now += 240000; runAutomaticUpdates();")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 2);
     }
 
     void premiumGamesRequirePaidMembershipBeforeLaunch_data()
@@ -522,8 +1239,9 @@ private slots:
         QFETCH(bool, refreshMembership);
         const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         engine.installExtensions(QJSEngine::TranslationExtension);
-        for (const auto &name : {"selectedLaunchAppId", "selectedGameMembershipError", "launchSelectedGame"}) {
+        for (const auto &name : {"selectedLaunchAppId", "launchSelectedGame"}) {
             const auto match = QRegularExpression(QStringLiteral(
                 "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
                 QRegularExpression::DotMatchesEverythingOption).match(shell);
@@ -533,38 +1251,45 @@ private slots:
         engine.globalObject().setProperty(QStringLiteral("requiredTier"), requiredTier);
         QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
             var signedIn = true, ready = true, streamBusy = false, onboardingReplaying = false;
-            var selectedGame = {launchAppId: "123", title: "Test", membershipTierLabel: requiredTier};
+            var root=this, selectedGame = {id:'parent',launchAppId: "123", title: "Test", membershipTierLabel: requiredTier, variants:[{id:'123',inLibrary:true}]};
             var authSession = {user: {membershipTier: "FREE"}};
             var subscriptionRequestId = "", streamState = "idle", streamMessage = "", lastError = "";
-            var settings = {}, regions = [], pendingLaunchParams = null;
+            var settings = {}, selectedRegion = '', regions = [], pendingLaunchParams = null;
             var requests = [], routes = [];
+            var storeLaunchTarget = null;
             var CoreClient = {request: function(method, params) {
                 requests.push({method: method, params: params}); return "request-" + requests.length;
             }};
-            var AppController = {navigate: function(route) { routes.push(route); }};
+            var AppController = {navigate: function(route) { routes.push(route); }, navigateFromLastPrimary: function(route) {routes.push(route);}};
+            function matchesAuthScope(scope) {return true;}
         )JS")).isError());
         QVERIFY(!engine.evaluate(QStringLiteral("var subscription = ") + subscriptionJson).isError());
         QVERIFY(!engine.evaluate(QStringLiteral("launchSelectedGame(false)")).isError());
-        QCOMPARE(engine.evaluate(QStringLiteral("streamState")).toString(),
-                 allowed ? QStringLiteral("checking") : QStringLiteral("error"));
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 1);
+        QCOMPARE(engine.evaluate(QStringLiteral("requests[0].method")).toString(), QStringLiteral("catalog.launch.inspect"));
+        QCOMPARE(engine.evaluate(QStringLiteral("routes.length")).toInt(), 0);
+        const auto handler = QRegularExpression(QStringLiteral(
+            "        function onResponseReceived\\([^\\n]*\\) \\{.*?\\n        \\}"),
+            QRegularExpression::DotMatchesEverythingOption).match(shell.section(QStringLiteral("property Connections launchInspectionResponses:"), 1));
+        QVERIFY(handler.hasMatch());
+        QVERIFY(!engine.evaluate(handler.captured()).isError());
+        engine.globalObject().setProperty(QStringLiteral("decisionStatus"), allowed ? QStringLiteral("ready") : refreshMembership ? QStringLiteral("metadata_unconfirmed") : QStringLiteral("subscription_required"));
+        QVERIFY(!engine.evaluate(QStringLiteral("catalogOwner.adoptGame=function(game){}; onResponseReceived('request-1',{appId:'parent',variantId:'123',game:selectedGame,decision:{status:decisionStatus,message:'Membership checked by core'}})")).isError());
+        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), allowed ? 2 : 1);
+        QCOMPARE(engine.evaluate(QStringLiteral("streamState")).toString(), allowed ? QStringLiteral("checking") : QStringLiteral("error"));
         QCOMPARE(engine.evaluate(QStringLiteral("pendingLaunchParams !== null")).toBool(), allowed);
-        QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), allowed || refreshMembership ? 1 : 0);
-        if (allowed || refreshMembership) {
-            QCOMPARE(engine.evaluate(QStringLiteral("requests[0].method")).toString(),
-                     allowed ? QStringLiteral("session.remote.list") : QStringLiteral("account.subscription.get"));
-        }
-        QCOMPARE(engine.evaluate(QStringLiteral("routes[0]")).toString(), QStringLiteral("inserting"));
+        QCOMPARE(engine.evaluate(QStringLiteral("routes[0]")).toString(), allowed ? QStringLiteral("inserting") : QStringLiteral("game-detail"));
         if (!allowed) {
             QVERIFY(!engine.evaluate(QStringLiteral("streamMessage")).toString().isEmpty());
             QCOMPARE(engine.evaluate(QStringLiteral("lastError")).toString(),
                      engine.evaluate(QStringLiteral("streamMessage")).toString());
             QVERIFY(!engine.evaluate(QStringLiteral("launchSelectedGame(true)")).isError());
-            QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), refreshMembership ? 1 : 0);
+            QCOMPARE(engine.evaluate(QStringLiteral("requests.length")).toInt(), 2);
             QVERIFY(!engine.evaluate(QStringLiteral(
                 "subscription = {membershipTier: 'ULTIMATE'}; launchSelectedGame(true)")).isError());
             QCOMPARE(engine.evaluate(QStringLiteral("streamState")).toString(), QStringLiteral("checking"));
             QCOMPARE(engine.evaluate(QStringLiteral("requests[requests.length - 1].method")).toString(),
-                     QStringLiteral("session.remote.list"));
+                     QStringLiteral("catalog.launch.inspect"));
         }
     }
 
@@ -591,6 +1316,7 @@ private slots:
     {
         const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         engine.installExtensions(QJSEngine::TranslationExtension);
         for (const auto &name : {"saveStreamClip", "disableStreamReplay", "resetStreamReplay"}) {
             const auto match = QRegularExpression(QStringLiteral(
@@ -667,6 +1393,7 @@ private slots:
             QRegularExpression::DotMatchesEverythingOption).match(tokens);
         QVERIFY(match.hasMatch());
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         engine.installExtensions(QJSEngine::TranslationExtension);
         auto formatter = engine.evaluate(u'(' + match.captured() + u')');
         QVERIFY2(formatter.isCallable(), qPrintable(formatter.toString()));
@@ -679,6 +1406,7 @@ private slots:
     void continuePlayingFormatsMetadata()
     {
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         engine.installExtensions(QJSEngine::TranslationExtension);
         for (const auto &entry : {
                  qMakePair(QStringLiteral("qml/desktop/components/DesktopTokens.qml"), QStringLiteral("relativeLastPlayed")),
@@ -746,6 +1474,7 @@ private slots:
         QVERIFY(groupsMatch.hasMatch());
 
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         engine.installExtensions(QJSEngine::TranslationExtension);
         auto evaluate = [&engine](const QString &script) {
             const auto result = engine.evaluate(script);
@@ -793,6 +1522,7 @@ private slots:
             const auto match = status.match(source(QString::fromLatin1(path)));
             QVERIFY(match.hasMatch());
             QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
             engine.evaluate(QStringLiteral(
                 "var streamer = {status:'streaming'}; var root = {streamer:streamer};"
                 "var ShellStore = {streamState:'streaming', streamerRestartAttempts:2};"));
@@ -808,6 +1538,7 @@ private slots:
         // Execute the actual ShellStore functions with side effects stubbed,
         // rather than just checking source text for a retry-limit constant.
         QJSEngine engine;
+        QVERIFY(prepareLaunchGuards(engine));
         auto evaluate = [&](const QString &script) {
             const auto result = engine.evaluate(script);
             if (result.isError())
@@ -816,14 +1547,16 @@ private slots:
         };
         QVERIFY(!evaluate(QStringLiteral(R"JS(
             var ready = true, activeSession = {sessionId: 'seat', phase: 'ready'};
+            var streamColorProfileObserved = false, streamRequestedColorQuality = '', streamColorFormat = null;
             var streamer = {status: 'starting', sessionId: 'seat'};
             var runtimeStreamProfile = {}, streamMessage = '', streamState = '', lastError = '';
             var streamerRestartAttempts = 0, sessionReconnectAttempts = 0;
+            var coreSessionRestoreId = '', sessionStopIntentId = '', streamPollFailureAttempts = 0;
             var streamerRecoveryExhausted = false, streamerRestartRecoveryCount = 0, sessionRecoveryCount = 0;
             var streamerStopExpected = false, streamInputStateKnown = false, streamRecordingActive = false;
             var streamStartedAtMs = 1, desiredStreamInputPaused = false, sessionClaimRequestId = '';
             var sessionClaimIsRecovery = false, streamerStartRequestId = '', streamerPrepareRequestId = '';
-            var sessionRecoveryPending = false, recoveryDiscoveryRequestId = '', recoverySessionId = '';
+            var sessionRecoveryPending = false, sessionRecoveryAwaitingAuth = false, recoveryDiscoveryRequestId = '', recoverySessionId = '';
             var streamerStopRequestId = '', streamStopRequestId = '', streamPollRequestId = '';
             var NativeStreamRuntime = {running: false}, nativeRuntimeCapabilities = {};
             var nativeRuntimeReady = true, prepares = 0, claims = 0, discoveries = 0;
@@ -831,13 +1564,16 @@ private slots:
                 restart: function() { this.running = true; this.restarts++; },
                 stop: function() { this.running = false; }};
             var streamPollTimer = {stop: function() {}, restart: function() {}};
-            var CoreClient = {request: function(type) {
+            var CoreClient = {cancel: function() {}, request: function(type) {
                 if (type === 'streamer.prepare') { prepares++; return 'prepare'; }
                 if (type === 'session.claim') { claims++; return 'claim'; }
-                if (type === 'session.remote.list') { discoveries++; return 'discovery'; }
+                if (type === 'session.poll') { discoveries++; return 'discovery'; }
                 throw new Error('Unexpected request: ' + type);
             }};
-            var AppController = {route: 'stream', overlay: ''};
+            var AppController = {route: 'stream', overlay: '', showOverlay: function(value) {this.overlay = value;},
+                navigateFromLastPrimary: function(value) {this.route = value;}};
+            function resetStreamReplay() {}
+            function stopNativeStreamer() {streamerStopExpected = true;}
             function qsTr(text) { return text; }
             function inspectStreamerOverlayRequest() {}
             function inspectStreamerScreenshotRequest() {}
@@ -854,10 +1590,12 @@ private slots:
         QVERIFY(limit.hasMatch());
         QVERIFY(!evaluate(QStringLiteral("var maximumSessionReconnectAttempts = %1;")
                               .arg(limit.captured(1))).isError());
-        for (const auto &name : {"acceptStreamerSnapshot", "recoverStreamingSession",
+        for (const auto &name : {"acceptStreamerSnapshot", "recoverStreamingSession", "sessionOwnerSignedIn",
                                 "scheduleSessionRecovery", "discoverRecoverySession", "acceptRecoverySessions",
                                 "normalizedStreamingSession", "acceptStreamingSession",
-                                "startNativeStreamer", "retryNativeStreamer", "acceptNativeEvent"}) {
+                                "isRemoteSessionTermination", "finishRemoteSession", "cancelSessionRecovery",
+                                "startNativeStreamer", "retryNativeStreamer", "acceptNativeEvent",
+                                "observeNegotiatedColorFormat", "acceptStreamColorFormat"}) {
             const QRegularExpression function(QStringLiteral(
                 "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
                 QRegularExpression::DotMatchesEverythingOption);
@@ -887,7 +1625,7 @@ private slots:
                 if (discoveries !== attempt || !sessionRecoveryPending || prepares !== attempt - 1)
                     throw new Error('Recovery must discover the active session before preparing media');
                 recoveryDiscoveryRequestId = '';
-                acceptRecoverySessions({sessions: [activeSession]});
+                acceptRecoverySessions({session: activeSession});
                 if (claims !== attempt || !sessionClaimIsRecovery)
                     throw new Error('Recovery must claim the discovered seat');
                 // Model a successful claim followed by a ready poll. The polling
@@ -923,6 +1661,35 @@ private slots:
             acceptNativeEvent({type: 'status', event: 'first-frame', status: 'streaming', backend: 'D3D11'});
             unchanged && streamerRestartAttempts === 0 && sessionReconnectAttempts === 0
                 && streamerRestartRecoveryCount === 2 && sessionRecoveryCount === 1;
+        )JS")));
+        QVERIFY(check(QStringLiteral(R"JS(
+            activeSession = {sessionId: 'seat', status: 3};
+            sessionRecoveryPending = true; recoverySessionId = 'seat';
+            var oldClaims = claims;
+            acceptRecoverySessions({session: {sessionId:'seat', status:7, phase:'finished'}});
+            activeSession === null && claims === oldClaims && streamState === 'idle'
+                && !streamerRestartTimer.running && AppController.route === 'game-detail';
+        )JS")));
+        QVERIFY(check(QStringLiteral(R"JS(
+            activeSession = {sessionId:'seat', status:3};
+            sessionRecoveryPending = true; recoverySessionId = 'seat';
+            acceptRecoverySessions({session:null, termination:{source:'cloudmatch-http', httpStatus:404,
+                sessionId:'seat', resumable:false}});
+            activeSession === null && claims === oldClaims && !streamerRestartTimer.running;
+        )JS")));
+        QVERIFY(check(QStringLiteral(R"JS(
+            activeSession = {sessionId:'seat', status:3}; streamerStopExpected = false;
+            streamer = {status:'error', message:'transport lost'};
+            streamerRestartTimer.restart();
+            acceptStreamerSnapshot({status:'stopped', termination:{source:'cloudmatch-session-status', status:7,
+                sessionId:'seat', resumable:false}});
+            activeSession === null && !streamerRestartTimer.running && streamState === 'idle';
+        )JS")));
+        QVERIFY(check(QStringLiteral(R"JS(
+            activeSession = {sessionId:'seat', status:3}; streamer = {status:'streaming'};
+            streamerStopExpected = false; sessionRecoveryPending = false;
+            acceptStreamerSnapshot({status:'error', message:'EOF', termination:{source:'nvst-transport', resumable:null}});
+            activeSession !== null && streamerRestartTimer.running;
         )JS")));
     }
 
@@ -1049,7 +1816,7 @@ private slots:
         };
         QVERIFY(!shell.contains(QStringLiteral("\"request-exit\": [\"Escape\"]")));
         QVERIFY(shell.contains(QStringLiteral(
-            "\"stop-stream\": [String(settings.shortcutStopStream || \"Ctrl+Shift+Q\")]")));
+            "\"stop-stream\": [String(settings.shortcutStopStream ?? \"Ctrl+Shift+Q\")]")));
         QVERIFY(shell.contains(QStringLiteral("requestStreamExitConfirmation()")));
         QVERIFY(shell.contains(QStringLiteral("desktop-stream-exit-confirm")));
         QVERIFY(desktop.contains(QStringLiteral(
@@ -1072,7 +1839,9 @@ private slots:
     {
         const auto main = source(QStringLiteral("qml/Main.qml"));
         const auto shell = source(QStringLiteral("qml/state/ShellStore.qml"));
-        QVERIFY(main.contains(QStringLiteral("sequence: \"F3\"")));
+        QVERIFY(main.contains(QStringLiteral("sequence: window.configuredStatsShortcut")));
+        QVERIFY(!main.contains(QStringLiteral("sequence: \"F3\"")));
+        QVERIFY(main.contains(QStringLiteral("window.configuredStatsShortcut !== \"\"")));
         QVERIFY(main.contains(QStringLiteral("context: Qt.ApplicationShortcut")));
         QVERIFY(main.contains(QStringLiteral(
             "onActivated: ShellStore.applyStreamShortcutAction(\"toggle-stats\")")));
@@ -1125,6 +1894,49 @@ private slots:
         QVERIFY(!main.contains(QStringLiteral("function syncPadHold()")));
     }
 
+    void profileUnlockKeepsStreamSurfaceAndShellInputOwnership()
+    {
+        const auto main = source(QStringLiteral("qml/Main.qml"));
+        QJSEngine engine;
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            var window = {active:true,activeRoute:'stream',streamSurfaceLocked:false,
+                desktopSurfaceActive:true,lockedStreamDesktopSurface:false,synchronizeRenderedSurface:function(){}};
+            var ShellStore = {activeSession:{sessionId:'seat'},authRestorePending:false,signedIn:false,
+                settings:{},streamOverlayBlocksGameplayInput:function(){return false;}};
+            var AppController = {route:'stream',overlay:''};
+            var ControllerInput = {};
+        )JS")).isError());
+        for (const auto *name : {"updateStreamSurfaceLock", "syncInputOwnership"}) {
+            const auto match = QRegularExpression(QStringLiteral(
+                "    function %1\\([^\\n]*\\) \\{.*?\\n    \\}").arg(QString::fromLatin1(name)),
+                QRegularExpression::DotMatchesEverythingOption).match(main);
+            QVERIFY(match.hasMatch());
+            QVERIFY(!engine.evaluate(match.captured()).isError());
+        }
+        QVERIFY(!engine.evaluate(QStringLiteral("updateStreamSurfaceLock(); syncInputOwnership();")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("window.streamSurfaceLocked && window.lockedStreamDesktopSurface && ControllerInput.shellCaptureEnabled")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("window.desktopSurfaceActive=false; syncInputOwnership();")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("!ControllerInput.shellCaptureEnabled && !ControllerInput.inputSuspended")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("window.desktopSurfaceActive=true; syncInputOwnership();")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("ControllerInput.shellCaptureEnabled")).toBool());
+        for (const auto *route : {"sign-in", "accounts", "profile-pin"}) {
+            engine.globalObject().setProperty(QStringLiteral("route"), QString::fromLatin1(route));
+            QVERIFY(!engine.evaluate(QStringLiteral(
+                "window.activeRoute=route; AppController.route=route; updateStreamSurfaceLock(); syncInputOwnership();")).isError());
+            QVERIFY(engine.evaluate(QStringLiteral("window.streamSurfaceLocked && window.lockedStreamDesktopSurface && ControllerInput.shellCaptureEnabled")).toBool());
+        }
+        QVERIFY(!engine.evaluate(QStringLiteral(R"JS(
+            window.activeRoute='stream'; AppController.route='stream'; ShellStore.signedIn=true;
+            updateStreamSurfaceLock(); syncInputOwnership();
+        )JS")).isError());
+        QVERIFY(engine.evaluate(QStringLiteral("window.streamSurfaceLocked && !ControllerInput.shellCaptureEnabled && !ControllerInput.inputSuspended")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("window.activeRoute='profile-pin'; ShellStore.activeSession=null; updateStreamSurfaceLock();")).isError());
+        QVERIFY(!engine.evaluate(QStringLiteral("window.streamSurfaceLocked")).toBool());
+        QVERIFY(!engine.evaluate(QStringLiteral("window.streamSurfaceLocked=true; ShellStore.activeSession={sessionId:'seat'}; window.activeRoute='settings'; updateStreamSurfaceLock();")).isError());
+        QVERIFY(!engine.evaluate(QStringLiteral("window.streamSurfaceLocked")).toBool());
+        QVERIFY(main.contains(QStringLiteral("function onActiveSessionChanged() { window.updateStreamSurfaceLock() }")));
+    }
+
     void cursorModeTransitionsCloseThePreviousButtonOwner()
     {
         const auto streamVideoSource = source(QStringLiteral("src/streaming/StreamVideoItemInput.cpp"));
@@ -1174,7 +1986,9 @@ private:
             var pendingLaunchParams = null, pendingDirectLaunch = null, streamState = 'idle', streamerStatus = 'stopped';
             var updaterCheckRequestId = '', updaterDownloadRequestId = '', updaterInstallRequestId = '', updaterStateRequestId = '';
             var updaterError = '', accessibilityMessage = '', updaterInstallConfirmed = false, updaterExitScheduled = false, updaterReconciling = false;
+            var updaterFailureMessage = '';
             var lastAutoUpdateCheckMs = 0, autoDownloadAttempt = '';
+            var autoDownloadAttemptCount = 0, autoDownloadAttemptMs = 0;
             var updaterState = {status:'downloaded',canInstall:true,canCheck:true};
             var settings = {autoCheckForUpdates:true,autoDownloadUpdates:true};
             var requests = [], callbacks = [], quits = 0;

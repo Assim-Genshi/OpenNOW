@@ -23,7 +23,7 @@ VIRTUAL_KEYS = {
 }
 PRINTABLE_SCANCODES = (
     set(range(2, 14)) | set(range(16, 28)) | set(range(30, 42))
-    | set(range(43, 54)) | {0x56, 0x73}
+    | set(range(43, 54)) | {0x56}
 )
 INTERNATIONAL_SCANCODES = {0x70: 93, 0x73: 89, 0x79: 92, 0x7B: 94, 0x7D: 124, 0x7E: 121}
 OUTPUT = Path(__file__).resolve().parents[1] / "opennow-qt/src/streaming/PhysicalKeyMapData.h"
@@ -37,9 +37,9 @@ def read_layout(driver, source_dir):
             data = response.read()
     root = ET.fromstring(data)
     keys = [0] * 128
-    selected = PRINTABLE_SCANCODES | ({0x7E} if driver == "KBDBR" else set())
+    selected = PRINTABLE_SCANCODES | ({0x73, 0x7E} if driver == "KBDBR" else set())
     if driver == "KBD106":
-        selected = selected | {0x3A, 0x70, 0x79, 0x7B, 0x7D}
+        selected = selected | {0x3A, 0x70, 0x73, 0x79, 0x7B, 0x7D}
     for key in root.findall("./PhysicalKeys/PK"):
         scan = int(key.get("SC", "0"), 16)
         if scan not in selected:

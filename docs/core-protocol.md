@@ -11,15 +11,188 @@ ambiguous state.
 The first shell request is always:
 
 ```json
-{"type":"request","id":"1","method":"core.hello","params":{"protocolVersion":1,"shell":"qt","shellVersion":"0.5.4"}}
+{"type":"request","id":"1","method":"core.hello","params":{"protocolVersion":5,"shell":"qt","shellVersion":"0.5.4"}}
 ```
+
+Protocol 5 requires an exact selected catalog variant and account scope for fresh
+session allocation. It retains the bounded library-page contract introduced in
+protocol 4. Older shells are rejected with `incompatible_protocol` during
+`core.hello`, and protocol-5 shells reject older cores. The native streamer
+protocol remains 7.
 
 The core must return the same protocol version and its capabilities. The shell
 does not send product requests before this succeeds. Version mismatches, a
 five-second handshake deadline, process exit and invalid data all transition the
 transport to `failed` with a credential-free diagnostic.
 
+The desktop queue selector requires the `queue.servers.v1` capability in this
+handshake. The Qt client and relocated package probes reject cores that omit it,
+including older protocol-5 binaries, before sending any product requests. This
+additive capability leaves the JSON envelope and native streaming ABI unchanged.
+
+## Cloud library actions and launch decisions
+
+`catalog.launch.inspect({appId, variantId})` always resolves the exact parent and
+store variant. Its response contains `appId`, `variantId`, `game`, `scope`,
+`catalogRevision`, `fetchedAt`, `freshness`, and `decision: {status, message}`.
+Statuses are `ready`, `ownership_required`, `selection_required`, `link_required`,
+`subscription_required`, `patching`, `maintenance`, `unavailable`, and
+`metadata_unconfirmed`. Only the selected variant's `MANUAL` or `PLATFORM_SYNC`
+library status records ownership. App-wide library flags, Home pins, favorites,
+free-game labels, store subscriptions, and ownership of another variant do not.
+Store-link requirements use the store definitions and fresh account state.
+Recorded store-subscription IDs must match the account's active subscriptions.
+App playability, variant readiness, patch metadata, and membership restrictions
+remain independent checks. Unknown metadata is not a positive authorization.
+
+`catalog.launch.store.inspect({store?})` resolves the platform-client apps for the
+current streaming region with a `PLATFORM_CLIENT` type filter and returns
+`{store, appId, variantId, game, scope, decision, catalogRevision, fetchedAt,
+freshness}`. The resolved `appId`, `variantId`, and `game` are the values the
+platform-client query returned for this account. `store` defaults to `STEAM`,
+the only supported store-client launch, and any other value is `invalid_params`.
+The eligible target is the first game exposing a variant whose exact `appStore`
+value matches the store and whose `id` is a bounded identifier; extra variants and
+extra platform-client apps are searched, not rejected.
+
+The store-launch decision reuses the shared decision vocabulary. It requires the
+exact parent identity and variant identity, the exact store on the resolved
+variant, a present `gfn.status` of `AVAILABLE`, and any patching or maintenance
+metadata the server returns. It then requires the persistent-storage entitlement:
+the subscription `addons` entry whose `type` is `STORAGE` and whose `subType` is
+`PERMANENT_STORAGE` and whose `status` is `OK`, which the core publishes as
+`subscription.storageAddon`. An ephemeral storage add-on, including
+`EPHEMERAL_STORAGE`, does not authorize a store launch. Store-account linking
+requirements, recorded store subscriptions, membership tier, and
+`isGamePlayAllowed` apply from the same account metadata the ordinary launch path
+uses.
+
+A platform client that the ordinary catalog resolution also returns is judged by
+that resolution's metadata, so catalog `playabilityState` and patch state are
+enforced there. When the ordinary resolution does not return the app, the store
+query's own `gfn.status` is the readiness field, because that query selects no
+catalog playability. When the ordinary resolution returns the app but not the
+discovered variant, the two sources disagree and the decision is
+`metadata_unconfirmed` rather than a guess.
+
+`catalog.launch.inspect` and `session.create` accept `storeLaunch: true`, a
+boolean that selects the platform-client resolution source and the
+persistent-storage requirement. The flag grants nothing: the same mutation
+admission, scope, catalog revision, active-seat, and exact-variant checks run, and
+a store intent that names a target the platform-client resolution does not return
+is not ready. Missing, non-boolean, or mismatched values do not fall back to
+another target.
+
+All five mutation RPCs require a bounded nonempty parent `appId` and the current
+`scope: {generation, userId, providerIdpId}`. Ownership mutations also require the
+exact `variantId`. `catalog.ownership.add` requires
+`confirmedExistingLicense: true`, the user's assertion that they already own the
+selected store license. This operation neither buys nor grants a license.
+`catalog.ownership.select` accepts only an owned variant and does not add ownership.
+
+Favorites map to the GraphQL `AddFavoriteApp` and `RemoveFavoriteApp` operations
+with `appId` and `locale` variables. Ownership maps to `AddOwnedVariant`,
+`RemoveOwnedVariant`, and `SelectOwnedVariant`, with `cmsId` and `locale`
+variables. `cmsId` supplies the `variantId` argument. Every mutation selects
+`app { id }` and checks the returned parent identity. Mutations share catalog
+scheduling and serialize conflicting actions for the same account and parent
+app. Fresh allocation holds that same app admission while checking and creating.
+
+Mutation results distinguish `outcome: acknowledged|unconfirmed` from
+`reconciliation: confirmed|unconfirmed`. A fresh exact read confirms the desired
+current state; acknowledgement alone does not. Results include captured target
+IDs, `operation`, `scope`, `catalogRevision`, nullable refreshed `game`, a visible
+`message`, and sanitized `error.code`, `error.httpStatus`, and `error.graphql`
+code/path details. `reconciliationCode` and `invalidationCode` distinguish read
+or cache-invalidation failures from the mutation outcome.
+Neither ambiguous failures nor HTTP 401 cause mutation replay. Catalog pages are
+invalidated before sending and again after the attempt. Cancellation may prevent
+delivery of the outcome without preventing an already-sent upstream mutation.
+The shell marks that outcome unconfirmed and refreshes metadata without resending.
+
+`catalog.favorites.list` reads the `FAVORITES` panel using `GetGameSection` with
+`panelNames`, `vpcId`, and `locale`; it has no cursor. It preserves all parsed game
+items up to the 1,000-game and 768-KiB response bounds, rather than the Store
+panel's 24-item display limit. The response contains `games`, section identity
+and `seeMoreInfo`, `scope`, `catalogRevision`, and `fetchedAt`. `coverage` is
+`unknown` and `complete` is false because the panel does not establish global
+completeness. No pagination or see-more request is invented. A failed read keeps
+the shell's last usable list, and a specific favorite is reconciled through the
+exact app's `library.favorited` value. Existing `favoriteGameIds` remain local
+Home pins; pinning, collections, hiding, and reordering do not upload favorites.
+
 ## Messages
+
+### Authentication boundary
+
+Protocol 5 auth responses and `auth.session.changed` events use the same envelope.
+`session` is either null or an allowlisted object containing `user` and `provider`.
+Credentials and issuing-client details remain private to the core. The envelope
+includes the core-process account `generation`, `persistence`, `refresh`, `warnings`,
+and `deviceIdentity`. Consumers reject older generations and reset their generation
+when a new core process completes its handshake. A token refresh does not change
+account generation.
+
+`auth.device.start` returns `attemptId`, `userCode`, verification URLs, `qrRows`,
+`expiresAt`, and `intervalSeconds`. Poll, complete, and cancel use `attemptId` only.
+The core retains the device grant and enforces the deadline, one in-flight poll,
+and cumulative five-second `slow_down` increments. Pending poll replies include
+`retryAfterMs`; the shell schedules one subsequent poll from that reply.
+Cancellation before the completion commit fence prevents persistence and publication.
+Once the fence is entered, completion is committed under auth ownership; cancelling
+its response does not undo that login. The shell reconciles such cancellation with
+`auth.session.get`. Logout or account replacement invalidates pending login/link work.
+
+Persistence intent is independent of outcome. Persistent sessions prefer the OS
+credential store on every desktop platform, including Windows. `secure-store` means
+the session was written to and verified in that store and its nonsecret index committed.
+`local-file` means session tokens are saved in unencrypted JSON because the OS store
+is unavailable. The per-account file is under
+`data_dir/fallback-sessions/<sha256 user>.json`, with private file access permissions.
+Those permissions do not encrypt the tokens. The shell warns that anyone who can read
+the file can access the account. Fallback reads take priority over stale OS-store entries.
+The next successful secure save verifies the OS-store entry before removing the JSON
+fallback.
+If the account-index commit fails after JSON is written, persistence remains
+`local-file` and warnings report that account restoration may fail. Interrupted
+JSON temporary files are removed on startup and during account cleanup.
+
+`memory-only` never writes a plaintext credential fallback. `migration-pending` means
+a recoverable legacy source remains because migration could not finish. `unavailable`
+means restoration failed. Warnings identify deferred cleanup without containing
+credentials, and the auth envelope never includes tokens. An explicitly temporary
+login suppresses automatic restoration of older saved grants for that identity.
+Legacy sources are removed only after verified persistence and metadata commit, or
+explicit account removal. This is file cleanup, not guaranteed secure erasure of
+backups or snapshots.
+
+Logout always ends local auth ownership and reports `remoteRevoke` separately from
+`localCleanup`. Revocation is best-effort DELETE of the selected client grant with an
+access bearer; all-account revocation has a five-second total network budget. Failed
+local deletion remains suppressed in the nonsecret account index and is retried on
+startup. Logout removes the JSON fallback even if the OS store remains inaccessible;
+deferred OS-store cleanup keeps the existing suppression semantics. A metadata write
+failure reports pending cleanup and cannot guarantee that suppression survives restart.
+Logout selects the next saved account only when it does not require a profile PIN.
+Automatic restoration, including a new core process, never activates a PIN-protected
+profile. Its credentials remain saved for an explicit PIN-verified switch. An already
+unlocked session remains active within the current core process.
+
+Qt loads saved profiles independently of signed-in account services. After a signed-out
+startup completes, saved profiles open in the existing account picker. An active stream
+does not trigger automatic navigation. Its user can open saved accounts explicitly from
+sign-in and unlock a profile without replacing the native video item.
+
+Logout-all also scans local fallback files independently of the account index. Missing
+or corrupt metadata cannot prevent best-effort plaintext cleanup. Recoverable identities
+are suppressed and removed from the OS store too. Unreadable identities or failed cleanup
+remain `pending`; corrupt metadata is not silently overwritten.
+
+The core persists one versioned 64-hex device identity. Upgrades freeze the previously
+derived identity using the current environment; if that environment changed before the
+first upgraded launch, the former hash cannot be recovered. Corrupt or unwritable identity
+storage is not replaced, new login is blocked, and restoration reports unavailable device
+identity rather than claiming durable compatibility.
 
 ```json
 {"type":"request","id":"42","method":"settings.get","params":{}}
@@ -46,7 +219,56 @@ pending retries. Other errors are delivered to the caller without retrying.
 Cancelled requests suppress their response. Store page retries/cache traversal
 and region measurement loops stop at cooperative checkpoints. An already-running
 blocking HTTP, DNS, or TCP operation is not forcibly interrupted; its existing
-timeout still applies. Mutating operations already dispatched are not rolled back.
+timeout still applies. Other mutating operations already dispatched are not rolled back.
+
+Protocol 5 retains the requirement for the Qt client to acknowledge an accepted successful `session.create`
+response with `{"type":"ack","id":"42"}` before delivering that response to QML.
+Cancelled or timed-out requests do not acknowledge late responses. The create worker
+retains its admission slot for at most ten seconds awaiting acceptance, then the
+CloudMatch owner deletes an unaccepted fresh allocation with an eight-second HTTP
+deadline. Fresh creation sends a CloudMatch POST without a follow-up PUT;
+cancellation after POST uses the same cleanup. PUT RESUME applies only to claims
+of existing sessions.
+The receipt does not apply to claims of existing sessions. A create response is not
+also broadcast as `session.changed`, preventing a late event from reviving a cancelled
+launch. Cleanup failure retains the seat and its scoped discovery route for explicit
+retry, blocks another fresh allocation, and reports `session_cleanup_pending`.
+The failed-cleanup record persists only the seat identity, app/status, trusted control
+route, original provider/account identity, and error code in `pending-session-cleanup.json`;
+it contains no tokens or signaling secrets. Discovery surfaces it only to that account.
+Explicit successful DELETE or not-found clears that exact record, never a different seat.
+HTTP-success DELETE responses containing an explicit vendor rejection retain ownership.
+The CloudMatch owner reserves fresh-create admission before endpoint resolution or POST.
+Concurrent creation, pending handoff, and in-progress cleanup lock contention fail promptly with
+`session_update_busy`, not the automatically retried `busy` response. Admission is
+released on every pre-ID error; after allocation the exact seat remains reserved until
+handoff or compensation completes. Cleanup records are read through a 16-KiB limit plus
+one overflow-detection byte before parsing, including for corrupt or oversized files.
+
+Raw CloudMatch status 7 is `phase: "finished"`, with a `termination` object containing
+`source: "cloudmatch-session-status"`, `status: 7`, and `resumable: false`. This proves
+the seat is terminal, not whether the game exited successfully; no vendor reason is
+invented. A targeted GET returning HTTP 404 yields `session: null` and a top-level
+termination with `source: "cloudmatch-http"`, `httpStatus: 404`, `sessionId`, and
+`resumable: false`. Authentication, invalid payloads, other HTTP failures, empty lists,
+and native transport closure are not terminal evidence. Recovery first polls the exact
+seat before claiming it. `session.poll` with `recoveryMode: true` does not broadcast a
+session change while the recovery owner is deciding whether to claim.
+
+Negotiated profiles retain normalized `bitDepth` (8 or 10), CloudMatch `chromaFormat`
+(0 or 1), and per-component `*Source` fields. `request`, `finalized`, `server`, and
+`unreported` distinguish present values from omissions. Same-seat partial updates retain
+previously known components; explicit finalized invalid values are not replaced with
+saved preferences. Incomplete or unsupported accepted color is rejected before native
+attachment. The native ABI and protocol version are unchanged; transport terminal
+events add `termination: {source: "nvst-transport", code, resumable: null}`, preserving
+unknown cloud-session disposition rather than assigning a normal-exit reason to EOF.
+
+After a decoder-stall recovery attempt, the native engine allows one further video-timeout
+interval for decoded output to resume. Output progress or a decoder-epoch change clears
+that deadline. Otherwise the engine emits `nvst-recovery-exhausted` and a stopped status
+once, allowing Qt to recover the session instead of leaving silent media connected forever.
+This does not classify the remote cloud session as ended.
 
 ## Implemented core methods
 
@@ -76,7 +298,7 @@ string (at most 4096 UTF-8 bytes); search is at most 512 UTF-8 bytes. Response:
 `{ "games":[], "count":0, "totalCount":0, "hasNextPage":false,
 "nextCursor":"", "source":"store-browse", "fetchedAt":0 }`.
 Pass `nextCursor` unchanged to the next call with the same search. A final page
-has `hasNextPage:false`; empty non-final pages may advance past unmappable apps.
+has `hasNextPage:false`; empty non-final pages may advance only when the upstream supplies an advancing cursor. Invalid mapped identities are errors.
 Missing, repeated or oversized continuation cursors are errors, not completion.
 
 Each result is limited to 768 KiB after JSON encoding, leaving room for the
@@ -156,7 +378,9 @@ and artwork only near the viewport, using the section's local category ID
 - `core.hello`
 - `app.status`
 - `settings.get`
+- `settings.choices.get`
 - `settings.set`
+- `settings.shortcuts.update`
 - `settings.reset`
 - `auth.providers.list`
 - `auth.session.get`
@@ -171,13 +395,21 @@ and artwork only near the viewport, using the section's local category ID
 - `auth.accounts.remove`
 - `auth.pin.status`, `auth.pin.set`, `auth.pin.clear`, `auth.pin.verify`
 - `catalog.public.list`
-- `catalog.library.list`
+- `catalog.library.list` returns one bounded upstream page, not an aggregate library.
+- `catalog.game.get`, `catalog.definitions.get`, `catalog.languages.get`
+- `catalog.launch.inspect`, `catalog.favorites.list`
+- `catalog.launch.store.inspect` resolves the eligible Steam store-client launch target.
+- `catalog.favorites.add`, `catalog.favorites.remove`
+- `catalog.ownership.add`, `catalog.ownership.remove`, `catalog.ownership.select`
 - `catalog.store.list`, `catalog.store.local`, `catalog.store.presentation`
 - `network.regions.list`
 - `network.regions.ping`
+- `queue.servers.list`
 - `account.subscription.get`
 - `account.connections.list`, `account.connections.sync`, `account.connections.unlink`
+- `account.connections.sync.status`, `account.connections.sync.cancel`
 - `account.connections.link.start`, `account.connections.link.poll`
+
 - `account.storage.locations`, `account.storage.reset`
 - `session.create`
 - `session.poll`
@@ -220,6 +452,35 @@ fields or treat an empty process-streamer snapshot as the embedded capabilities.
 
 ### Session resume and reconnect
 
+`session.active.get` without hints remains a local-only lookup. After a core
+restart, Qt can reconcile an existing native stream by supplying
+`{sessionId, ownerScope: {userId, providerIdpId}}` after authentication is restored.
+Both hints are required together. The session ID must contain 1–256 ASCII letters,
+digits, hyphens, or underscores; each owner identity must contain 1–1024 bytes and
+match the authenticated selected account. An optional old `ownerScope.generation`
+is ignored because generations are process-local. Caller-supplied endpoints are
+ignored.
+
+Hinted reconciliation discovers the exact seat through authenticated, core-owned
+provider routes and reads its current state with GET. It restores local control
+context and ownership without RESUME/PUT, allocation, or native transport changes.
+An already-owned matching seat returns its current local state. Another seat or
+owner fails with `session_owner_mismatch`. Successful results use the existing
+`{session, scope}` shape and publish the current generation in `scope` and
+`session.ownerScope`, preserving the remote phase without adding `resumePending`.
+
+A missing discovery match fails with `session_discovery_failed`; authentication,
+network, cancellation, and stale-account failures remain errors. Local absence is
+not termination. Only an exact-seat GET reporting status 7 or HTTP 404 confirms
+termination. Status 7 includes `session.termination`; HTTP 404 returns
+`{session: null, termination: {source: "cloudmatch-http", httpStatus: 404,
+sessionId, resumable: false}, scope}`. Qt keeps the native stream alive while
+retrying reconciliation errors and resumes ordinary session polling after local
+ownership is restored.
+Scope-checked discovery also authorizes exact-seat cleanup if reconciliation is
+cancelled before active ownership is adopted. A later account generation cannot
+reuse that discovery to stop a seat.
+
 `session.remote.list` checks the selected endpoint and the regions advertised by
 CloudMatch instead of treating the first empty regional response as authoritative.
 Discovery deduplicates session IDs and uses at most four concurrent requests, a
@@ -227,15 +488,161 @@ three-second per-request timeout, a 12-second total budget (including region
 discovery), and at most 32 regional endpoints. If no sessions were found but a
 region failed, returned invalid data, or could not be checked within these bounds,
 the request fails with `session_discovery_failed` rather than returning an empty
-list. Authentication failures remain `authentication_required`. A found session
+list. HTTP 401 remains `http_unauthorized` after at most one safe-read renewal;
+HTTP 403 remains `authentication_required`. A found session
 can be returned even when another region fails; an empty successful list means
 all discovered regions were checked successfully. Callers must not create a new
 session after a discovery failure.
 
+### Provider routing and account scope
+
+`auth.providers.list` returns `providers`, `defaultProviderIdpId`, `generation`, and
+`discovery: {state, message, retryAfterMs}`. Successful discovery is fresh for
+15 minutes. A failed refresh retains the last known providers and reports
+`state: "degraded"`. Without a discovered list, the response includes the restored
+provider, when present, and an explicit NVIDIA fallback. This fallback is not
+authoritative discovery. Retries wait at least 30 seconds; HTTP 429 `Retry-After`
+can extend the wait up to one hour. Qt performs at most three automatic retries.
+An explicit unknown `providerIdpId` fails with `provider_unavailable` rather than
+selecting another provider. Endpoint updates reconcile by exact IDP identity.
+
+Authenticated catalog and account reads include
+`scope: {generation, providerIdpId, userId}`. Core reads capture private ServiceId
+credentials and reject obsolete account/provider generations before publishing.
+HTTP 401 permits one renewal and one replay of a safe read for the same owner.
+HTTP 403 does not trigger renewal. Create, claim, account sync/unlink, and storage
+reset do not replay mutations after an ambiguous response.
+
+Authenticated VPC lookup requires a successful server-info response with a
+nonempty `requestStatus.serverId`. Missing or rejected metadata is an error,
+not a successful `GFN-PC` library. VPC cache entries are scoped by provider route,
+account, credential, generation, and proxy, with coalescing within each scope.
+Library and VPC requests use the same selected proxy. The core does not silently
+retry a selected proxy directly. Authenticated HTTP clients do not follow redirects.
+LCARS retains its configured shared endpoint; an Alliance provider ID does not
+select `GFNPartnerJWT` or invent a GraphQL hostname.
+
+`settings.set` for `region` also requires the current `providerIdpId`. The core
+atomically updates `region`, `regionProviderIdpId`, and the `providerRegions` map.
+The metadata fields cannot be written separately. Existing unscoped preferences
+remain eligible only for NVIDIA. Region overrides must occur in the current
+provider's server-info list. An unavailable or incompatible override falls back
+once to that provider's base without deleting the saved preference. Provider and
+region bases must be HTTPS NVIDIA-grid names without userinfo or nonstandard ports.
+Arbitrary partner domains require a separate evidenced trust policy.
+
+### Free-tier queue locations
+
+`queue.servers.list({})` returns `{locations, recommendedZoneId}`. Each location
+contains `zoneId`, `title`, `region`, `queuePosition` (nonnegative integer),
+`etaMs` (milliseconds or null), `lastUpdated` (Unix seconds), `pingMs`
+(milliseconds or null), `streamingBaseUrl`, and `alternateCount` (the number of
+other fresh zones folded into this location). Missing mapping entries retain
+their raw zone ID as the title and a friendly continent name as the region.
+Mapping failure does not prevent use of valid queue data. Mapping entries marked
+`nuked: true`, malformed rows, non-NVIDIA zones, timestamps over 15 minutes old,
+and timestamps more than 60 seconds in the future are excluded. No usable fresh
+rows, invalid queue payloads, and HTTP failures return `queue_servers_failed`;
+cancellation returns `cancelled`.
+
+The core requests PrintedWaste's public queue and mapping endpoints without
+credentials, account identifiers, cookies, proxies, or redirects. Each fetch has
+a five-second deadline and a 256 KiB streamed body limit, with at most 256 input
+entries and 128 usable zones. Only strict `NP-<3–8 uppercase alphanumeric
+location beginning with a letter>-<2 digits>` identifiers generate a probe or
+launch URL: `https://<lowercase-zone>.cloudmatchbeta.nvidiagrid.net/`. Neither
+provider payload can supply an arbitrary host. Latency uses a TCP warm-up and two
+TCP connection samples, each bounded to 750 ms across all resolved addresses,
+with 50 ms between samples. Probes run in batches of at most 32 and check
+cancellation between samples and batches. DNS resolution has a 750 ms caller
+deadline, uses at most 32 resolver workers and 32 queued jobs, and returns at most
+eight addresses per host. Stalled system DNS calls cannot block the caller or
+spawn additional workers; expired/cancelled jobs are skipped before resolution.
+`pingMs` is the rounded-up mean of successful TCP samples, excluding DNS, TLS,
+and server processing. All-failed probes produce null latency, not fabricated
+ping values.
+
+Zones sharing a title and region are grouped. Each primary and the final
+recommendation prefer measured zones when available, then minimize a normalized
+75% latency / 25% queue score. A score winner above 100 ms is replaced by the
+lowest-latency candidate. Without measurements the shortest queue wins. Ties
+are deterministic. `recommendedZoneId` always names a returned location primary;
+that row sorts first, with remaining rows ordered by region and title.
+
+The desktop shell presents this selector only for an explicitly known `FREE`
+NVIDIA membership, not for unknown membership or alliance accounts.
+`hideQueueSelector` is a persisted boolean preference, default `false`, exposed
+through the standard settings API and boolean normalization. It does not change
+the separate region-selector preference. The public queue RPC is unauthenticated
+and does not itself authorize gameplay or infer membership.
+
+For a fresh NVIDIA launch, the shell may pass a selected location's exact `zone`
+and `streamingBaseUrl` to `session.create`. The core accepts a strict zone and
+its exact derived URL for the NVIDIA IDP and NVIDIA provider code even when that
+zone is absent from server-info discovery. This exception does not apply to
+alliance providers, does not alter persisted region preferences, and does not
+bypass account scope, catalog eligibility, or subscription checks. All other
+region overrides retain the provider-discovery rules above.
+
+`session.create` requires `catalogAppId` as the parent LCARS identifier,
+`variantId` as the selected positive GraphQL Int identifier encoded as a string,
+and `appId` equal to that exact variant ID. `scope` must contain the current
+`generation`, `userId`, and `providerIdpId`. The core resolves fresh catalog and
+account metadata and applies the same decision as `catalog.launch.inspect`
+immediately before allocation. Only `ready` admits a fresh allocation. A decision
+from an earlier inspection is not a transferable permission. Missing, foreign,
+or mismatched identifiers do not fall back to another variant or a title.
+Existing validated seat claims remain separate and never write ownership.
+
+`session.create` acquires a single typed CloudMatch admission guard before provider
+discovery, authentication, or route locks. A concurrent create returns
+`session_update_busy` immediately instead of waiting to allocate after the first
+request fails or is cancelled. Pre-allocation failure releases the guard; after
+an allocation exists, the existing receipt and exact-seat cleanup state continue
+to prevent another allocation.
+
+CloudMatch requests serialize with account changes. An active seat belongs to
+its exact session ID, user ID, and provider IDP, independently of the account
+generation. Returning from account A to B to A, clearing caches, or signing in
+again as A does not revoke A's ownership. New owned-seat operations publish the
+current generation and retain the core-captured control and media endpoints.
+An active seat retains its original account for polling and exact-seat cleanup
+after a switch or logout.
+If that retained credential expires, `session_owner_authentication_required`
+asks the user to return to the original account without restarting media.
+New-account credentials never authorize requests to the retained seat. When the
+selected account matches that owner, explicit cleanup renews expired ServiceId
+credentials before issuing DELETE. A rejected DELETE is not automatically replayed.
+Session results include `ownerScope` inside `session`; Qt distinguishes updates
+for its existing native session from unrelated old-account responses. Ordinary
+asynchronous results, discovered seats, and catalog results remain generation
+fenced. A new allocation's receipt retains its original generation even when
+the active seat is republished under a newer generation; an obsolete receipt
+still triggers exact-seat compensation.
+
+Qt accepts authoritative terminal status 7 or HTTP 404 for the exact displayed
+session and its user/provider identity even when the result's generation is old.
+This exception applies before ordinary response and `session.changed` scope
+filters. It does not admit stale nonterminal updates, another account/provider,
+another session ID, or a resumable or non-authoritative termination. Duplicate
+terminal delivery cannot end a replacement seat.
+
+`streamer.prepare` uses the caller's session ID to resolve the current core-owned
+active seat. Caller-supplied connection endpoints are ignored. The response also
+returns the owned `session` with its current `ownerScope`, which Qt retains for
+later session events. Foreign ownership or an unknown seat fails with
+`session_owner_mismatch`, a non-ready seat with
+`session_not_ready`, and missing RTSPS endpoints with `session_endpoint_missing`.
+The existing negotiated profile checks still run. Preparation does not expose
+OAuth tokens to Qt or alter the native `/rtsp` websocket session-ID authentication.
+These fields are additive to protocol 5; allocation receipts and exact-seat
+compensation remain unchanged.
+
 `session.create` reports an existing-session limit as `session_conflict`, including
 CloudMatch status `11`, `SESSION_LIMIT` descriptions, and unified error
 `4AF1201E`, including structured session-limit responses with HTTP 403. An
-unrecognized HTTP 403 or an HTTP 401 remains `authentication_required`. The
+unrecognized HTTP 403 remains `authentication_required`; HTTP 401 is
+`http_unauthorized`. Session creation is never automatically replayed. The
 rejected request never becomes an active local session. The shell
 should call `session.remote.list` once and offer to resume or end the existing
 session instead of displaying the raw vendor error or retrying creation. When the
@@ -279,6 +686,24 @@ Failed recovery attempts back off up to eight seconds and stop after eight
 attempts; only a presented first frame resets this budget. Ending the session cancels
 recovery. A native stop stalled for 30 seconds reports an error without launching
 another transport over the still-owned resources.
+
+An exhausted video SETUP negotiation (`missing-video-peer`) or an explicitly
+unsupported legacy transport (`nvst-legacy-transport-unsupported`) stops automatic
+recovery and preserves the original error and owned seat for an explicit retry or
+stop. These compatibility failures do not trigger another claim of the same seat.
+
+For the embedded Qt client, `session.create` also accepts an optional numeric `maxEntitledFps`:
+the highest frame rate the signed-in membership entitles at the requested resolution, or `0`
+or absent when that is not confirmed. Qt derives it from the normalized `entitledResolutions`
+entries it already displays; the core never invents it. The requested frame rate is bounded by
+the documented resolution ceiling (1920x1080 and 1920x1200 top out at 360 FPS, every other
+resolution at 240 FPS) and, above 240 FPS, by both a hardware decoder for the selected codec
+confirmed in `runtimeCapabilities` and an entitlement limit that covers the requested rate.
+An absent or software-only capability probe and an absent or lower entitlement limit both bound
+the request to the unconditional 240 FPS ceiling, so the saved preference cannot request the
+conditional tier without affirmative evidence. This is a necessary condition, not a throughput
+qualification: the client does not measure decoder throughput, and CloudMatch remains the
+authority on the finalized profile.
 
 For the embedded Qt client, `session.create` and `streamer.prepare` accept an optional
 `runtimeCapabilities` object copied from the in-process streamer's protocol-7 `hello` response.
@@ -332,8 +757,25 @@ Qt resolves the saved identity to a current-boot Windows adapter LUID. The same
 LUID selects Qt's D3D11 adapter and the native runtime's capability probes; LUIDs
 are not persisted. A missing saved GPU falls back for that launch without
 erasing the preference. The settings selector appears only with at least two
-detected hardware adapters, excluding software adapters. Saving a different GPU
-affects the next application launch, not the active graphics device or session.
+detected hardware adapters, excluding software adapters. It is on the Stream
+settings page. Saving a different GPU affects the next application launch, not
+the active graphics device or session.
+
+Adapters are enumerated high-performance first. Before that launch, each adapter
+is indexed for H.264, HEVC, and AV1 hardware decode profiles at 1920×1080 or
+1280×720. Automatic uses the first adapter in that order that exposes one of
+those profiles. A hybrid laptop whose discrete GPU has no decoder, such as a
+GeForce MX110 beside Intel HD Graphics 620, therefore uses the integrated GPU
+instead of failing the session. An explicit saved GPU is still used even when
+its index is empty. Each settings choice lists the codecs that index found.
+
+The embedded streamer's protocol-7 `hello` may include `graphicsAdapters`. The
+field is omitted when no adapters were indexed. Each entry has `name`, `active`,
+`codecs` (`h264`, `h265`, `av1`), `h265Main10`, and an optional `reason`. It does
+not include the adapter LUID. `active` marks the adapter selected for that
+process. When no hardware backend is available and another indexed adapter can
+decode, the session error names that GPU and points to Settings → Stream →
+Graphics processor. Diagnostics copy the same allowlisted fields.
 
 ### Recording and replay capture
 
@@ -409,14 +851,52 @@ the saved color preference is used, subject to exact hardware profiles and the G
 restrictions below. Callers without embedded runtime
 capabilities cannot request HDR through the external-streamer probe path.
 
-CloudMatch receives `sessionRequestData.sdrHdrMode=1`, monitor `sdrHdrMode=1`, and
-`requestedStreamingFeatures.trueHdr=true` only for this validated HDR request. CloudMatch
+CloudMatch receives `sessionRequestData.sdrHdrMode=1` and monitor `sdrHdrMode=1`
+only for this validated HDR request. `requestedStreamingFeatures.trueHdr=false` remains
+separate because TrueHDR is the server's AI SDR-to-HDR filter, not native HDR. CloudMatch
 uses bit-depth/chroma enums `1/0` for 10-bit 4:2:0 and `1/1` for 10-bit 4:4:4.
-For HDR, monitor `displayData` requests maximum luminance 1000 nits, minimum luminance 0,
-and maximum frame-average luminance 400 nits,
-matching the Mac native session payload. These are fixed requested-content defaults, not
-measurements of the physical display; no caller-supplied luminance is accepted in this
-contract. SDR luminance values and all display primaries remain zero protocol defaults.
+For HDR, monitor `displayData` carries validated output luminance
+when the current output reports it. `desiredContentMaxLuminance` is the peak in nits;
+`desiredContentMinLuminance` is the minimum in 0.0001-nit units, rounded after
+multiplication by 10000. Wayland color-management supplies only this luminance pair.
+`desiredContentMaxFrameAverageLuminance` is omitted for a pair-only snapshot because
+Wayland exposes no comparable sustained full-frame value. When the runtime supplies
+a complete validated optional group, the core also writes its full-frame nits into
+that field and writes the red, green, blue, and white chromaticities as rounded
+`xy * 50000` integers in `displayPrimaryX0/Y0`, `displayPrimaryX1/Y1`,
+`displayPrimaryX2/Y2`, and `displayWhitePointX/Y`, respectively. The official PC
+client's Bifrost serializer confirms the field order and scales; the mapping from
+the display's maximum full-frame luminance to the frame-average field is inferred
+from native struct offsets, not an observed HDR session.
+
+Without a validated output snapshot, HDR requests keep the fixed requested-content
+defaults of maximum luminance 1000 nits, minimum luminance 0, and maximum frame-average
+luminance 400 nits, matching the Mac native session payload. Those defaults are requested
+content characteristics rather than measurements of the physical display and are not
+presented as calibration. SDR sends `displayData:null`. HDR does not invent display
+primaries or a white point; those fields require validated chromaticities from the
+current runtime output.
+
+The validated snapshot travels from Qt in `runtimeCapabilities.nativeHdrDisplay` as
+`minimumNits` and `maximumNits` in cd/m², omitting either value the output does not
+report. Optionally it also carries `maximumFullFrameNits` and normalized floating-point
+`redX/redY`, `greenX/greenY`, `blueX/blueY`, and `whiteX/whiteY`. The core validates
+the pair again and drops it when the bounds are not finite, negative, above 10000 cd/m²,
+or not strictly increasing. It accepts the optional group only when every coordinate
+is finite, within [0, 1], has a valid xy sum and positive y, the primaries form a
+nondegenerate triangle, and `minimumNits < maximumFullFrameNits <= maximumNits`.
+Missing or invalid optional fields discard the entire group but retain a valid pair.
+The snapshot is transient:
+`settings.set` rejects it, the settings loader discards persisted copies, and the core
+never saves runtime capability results.
+
+Stale snapshots are discarded rather than reused. Qt injects the snapshot only while the
+current output reports a validated range and removes any caller-supplied or previously
+injected value when it does not; the core strips any earlier snapshot from the resolved
+settings before carrying the current capability, so a display change that invalidates the
+output falls back to the requested-content defaults instead of replaying the previous
+display's luminance. Claim and resume requests do not carry monitor settings at all, so
+they cannot replay one either.
 
 The normalized server response carries `negotiatedStreamProfile.enableHdr: boolean`. It
 comes from the returned session's `sdrHdrMode`, then the returned monitor's mode, then the
@@ -424,9 +904,9 @@ returned session-request mode; missing or unsupported modes mean SDR. An explici
 SDR response wins over saved HDR intent. `trueHdr` is not used to infer accepted dynamic
 range. Resume preserves that returned mode rather than renegotiating from current settings.
 The claim request intentionally omits monitor settings and requested streaming features, so
-its only copied dynamic-range field is the accepted session `sdrHdrMode`. The initial
-compatibility RESUME carries the full request and updates its session mode, monitor mode,
-requested-content luminance, and `trueHdr` consistently when the server has returned a mode.
+its only copied dynamic-range field is the accepted session `sdrHdrMode`. Fresh creation
+sends the full request in its POST, with the requested session mode, monitor mode,
+requested-content luminance, and `trueHdr`; only an existing-session claim uses PUT RESUME.
 Attachment revalidates the session's HDR codec/color profile and current window output, so
 moving to an SDR display cannot silently resume an HDR stream as SDR.
 
@@ -447,8 +927,12 @@ CloudMatch chroma enums are `0` for 4:2:0 and `1` for 4:4:4; NVST chroma-format 
 When present, `session.negotiatedStreamProfile.codec` takes precedence over the numeric
 feature-map codec. H.264/AVC and H.265/HEVC names normalize to `H264` and `H265`;
 `AV1` remains unchanged. An explicit null or unsupported codec stays unknown rather
-than falling back to a requested codec. When the server omits every codec field, a new
-allocation retains the exact codec sent in that allocation's request. Polling, direct-server
+than falling back to a requested codec. The request itself names no codec: like the
+official client, codec selection stays client-side and reaches the seat in the RTSP
+ANNOUNCE (`x-nv-vqos` bit-stream format), so a negotiated codec is only ever
+server-reported (echo, finalized features, or a direct profile). When the server omits
+every codec field, downstream stages resolve the codec from current saved preferences
+instead. Polling, direct-server
 responses, claims, and ad updates preserve that evidence only for the same session ID.
 `codecSource` distinguishes `request`, `server`, and `unreported`; a reported codec supersedes
 the request and remains authoritative in later partial responses. Unknown discovered sessions
@@ -460,13 +944,26 @@ allocation, even if a decoder capability lists those formats. These combinations
 requested by the supported GFN wire policy. Auto selects HEVC for 4:4:4 rather than silently
 reducing chroma; an explicit incompatible codec remains an error.
 
-The native context preserves the resolved profile and codec provenance, and `MediaStreamConfig.hdr` follows its
-`enableHdr` alone (missing means false). Invalid accepted HDR profiles are rejected before
-stream startup. NVST ANNOUNCE sends `x-nv-video[0].dynamicRangeMode=1` for HDR and `0` for
-SDR, with literal bit depth `10` or `8`. Its `chromaFormat` uses chroma_format_idc (`1` for
-4:2:0, `3` for 4:4:4), unlike CloudMatch's enum. The captured Mac native ANNOUNCE confirms
-10-bit 4:2:0 as `bitDepth:10` / `chromaFormat:1`; its seat control notification `0x010e`
-reports a separate runtime mode and must not be confused with CloudMatch's `trueHdr` field.
+The native context preserves the resolved profile and codec provenance. Its accepted
+`enableHdr` initializes the native HDR mode (missing means false). Invalid accepted HDR
+profiles are rejected before stream startup. NVST ANNOUNCE states color explicitly on
+every session using literal bit depth `8` or `10` with `chroma_format_idc`
+(`chromaFormat=1` for 4:2:0, `3` for 4:4:4); `dynamicRangeMode=1` is sent for HDR
+only, and SDR omits the line. This matches the vendor capture of a `10bit_420`
+session (`bitDepth:10 chromaFormat:1`) and the working third-party reference
+clients: a lone `bitDepth` line is never sent, because seats cannot initialize
+an encoder from an incomplete color spec. The internal 0/1 chroma value from the
+client's app-to-NVST conversion is mapped back to idc at SDP emission and never
+reaches the wire. CloudMatch keeps its own bit-depth enum (`0` or `1`) with
+chroma `0`/`1`.
+
+The ANNOUNCE also carries the encoder identity the seat reads before
+initializing (`maxCodecProfile`/`maxCodecLevel` and the `maxH264` pair, profile
+3 / level 61, as captured). One resolved configuration feeds the wire values,
+the media runtime, and the decoder, so a server color choice cannot leave the
+decoder expecting a different format. The stored CloudMatch profile and user
+preferences are not rewritten. Full SDP must not be logged because it contains
+ICE credentials and encryption material.
 
 After an update check, `updater.highlights.get` returns the latest published
 release notes for the selected channel, even when that release is equal to or
@@ -517,7 +1014,11 @@ counts as success.
 On a later launch, the core reconciles these managed outcomes against the native
 package registration and its running version. A known live installer keeps
 `managed-pending` active. A completed installer resolves to `succeeded` or
-`failed`, and the core clears the persisted active transaction. An MSI reboot
+`failed`, and the core clears the persisted active transaction. Terminal helper
+outcomes (`succeeded`, `rolled-back`, `failed`) are likewise reported for that
+launch only; the core clears the persisted transaction after the first
+reconciliation so the same failure dialog does not reappear on every restart.
+An MSI reboot
 warning remains until Windows' per-boot sequence number changes. Sessions
 remain available, but another update must wait for the required reboot so it
 cannot overlap pending Windows file replacements. Reopening the app before
@@ -556,6 +1057,29 @@ Setting `appAccentColor` enables `themeAccentOverride` in the same save. The
 in `changes`; clients can still override appearance or restore the pack accent
 by setting `appTheme` or `themeAccentOverride` independently.
 
+`settings.shortcuts.update` writes stream shortcut bindings as one transaction:
+`{"bindings":{"shortcutToggleStats":"Ctrl+F11","shortcutScreenshot":""}}`. Only the
+existing `shortcut*` setting keys are accepted, each value is a string of at most 80
+bytes (empty means unbound), and `Ctrl+G` and `Shift+F3` stay reserved. After the
+change is merged, no two non-empty bindings may share a chord (case and modifier
+order are ignored). Any rejection leaves every binding unchanged. The core persists
+the whole map in one save and rolls it back in memory if the save fails. The response is
+`{"bindings":{...applied}}`; the `settings.changed` event names the first applied
+key and carries the full map in `changes`. Qt uses this for moving a chord from one
+command to another, clearing, resetting one binding, and resetting all bindings.
+
+Each successful settings write publishes `settings.changed` before its own
+response. A client that starts its next per-key write from that response has
+already consumed the previous event. Other response/event pairs, including
+`settings.reset`, retain their existing response-first order.
+
+Qt delivers `settings.changed` before the corresponding response rather than deferring
+it through the general event queue. The settings owner serializes writes per key, keeps
+ordinary controls optimistic, and retains a confirmed snapshot for failure rollback.
+Later edits use the latest intended value; a failed queued tail restores the last confirmed
+value and its coupled changes. Confirmation-sensitive settings and collection callbacks
+retain their existing behavior.
+
 Settings writes use a temporary file plus recoverable backup and normalize
 compatibility-sensitive values. `audioOutputDevice` is an opaque native output identifier
 (at most 1024 UTF-8 bytes, without NUL characters); an empty string follows the
@@ -570,7 +1094,12 @@ pre-opt-in settings receive a one-time reset of automatic switching only;
 explicit subsequent opt-ins and the independent startup preference are preserved.
 Existing microphone device selections are cleared only when explicitly selecting Open
 microphone; that write likewise reports `"changes":{"microphoneDeviceId":""}` so the
-shell follows the system-default capture selection.
+shell follows the system-default capture selection. Setting `colorQuality` repairs an
+explicitly saved `codec` (or `fallbackCodec`) the new color mode cannot use toward
+`auto` in the same save — H.264 is 8-bit 4:2:0 only, AV1 is 4:2:0 only — and reports
+the repair in `changes`. Explicit `codec`/`fallbackCodec` selections the saved color
+cannot use are rejected as `invalid_setting` instead; unknown spellings still clamp
+to Auto.
 
 `onboardingCompleted` is a persisted boolean, defaulting to `false` for a new
 profile or an unreadable or malformed settings file. A valid existing settings
@@ -632,3 +1161,260 @@ in [the machine-readable parity manifest](../native/opennow-core/contracts/legac
 validated against its [JSON schema](../native/opennow-core/contracts/legacy-open-now-api.schema.json)
 and executable golden-fixture tests. A method is not considered ported until its
 owner, wire shape, fixtures and replacement disposition are recorded there.
+
+### Push invalidation capability
+
+Protocol 5 advertises `account.pushInvalidation.v1` when the core ships the native
+push subscriber. The capability only describes the accelerator below; the shell
+must keep working when it is absent.
+
+The core may open a native FCM/PNS subscription for the signed-in account. The subscription is
+provider-scoped and bounded: it exists only while an account is signed in, and it is torn down or
+paused on sign-out, account switch, or shutdown.
+
+`push.json` in the data directory is an optional override, never required. When it is genuinely
+absent, the core uses a bundled default built from the vendor's public client identifiers (see
+provenance below). When it is present, it always wins: the core never falls back to the bundled
+default for an existing override. The override is either a single object or an array of objects,
+each with `providerIdpId`, `projectId`, `apiKey`, `senderId`, `appId`, `firebaseAppId`, optional
+`vapidKey`, `pnsServer`, optional `pnsVersion`, and `pnsClientId`, plus an optional `enabled`
+boolean. The entry whose `providerIdpId` matches the signed-in provider is the only one used. A
+present override suppresses the default when it disables push (`"enabled": false`, whole-file or
+per entry), is unreadable, malformed, or larger than 64 KiB, or carries no complete entry for the
+signed-in provider. The override file is read-only deployment input: the core never writes it,
+never logs it, never returns it from `settings.get`, and never stores it in the user settings
+schema.
+
+The bundled default contains only public client identifiers: a Firebase web API key, app,
+project, and sender identifiers, the VAPID public key, and the PNS client id and server. It
+carries no credentials and the core never writes it to the data directory. Per-account and
+per-device secrets — the ECE key pair, the auth secret, and the GCM/FCM tokens — are generated
+locally and stay in the OS credential store, and the PNS bearer token is the user's own sign-in
+token. The default is bound to the authenticated provider and generation snapshot by the same
+owner guards as an override, so it is re-evaluated on account and provider changes. Whether the
+PNS backend accepts registrations for providers other than the vendor's own is unverified; the
+bundled default mirrors the vendor client's authenticated-account gate and does not claim
+guaranteed acceptance.
+
+The bundled default derives from the vendor's public client configuration asset
+(`shared/assets/config/config.json` inside the official package, SHA256
+8e7db09026e5b48b0eabb364395c726543fcab9778b3561529fcb6a96208db65; official package archive
+SHA256 47ddbe0425b9ab560f64fa42a0052794c9de335ded0fd59637f082dd7a161ad4), mapping
+`firebase.pns` to the Firebase identity and `pnsServerConfig` to the PNS endpoint. A subscription
+delivers invalidation hints only. Each hint is emitted as an ordinary event envelope:
+
+```json
+{"type":"event","name":"account.push.changed","payload":{"generation":7,"kind":"library","changedIds":["app-id"]}}
+```
+
+`kind` is one of `library`, `favorites`, `subscription`, `linked-account`, or
+`platform-sync`. `generation` is the GFN state generation the hint belongs to;
+a shell drops hints whose generation does not match its current account
+generation. `changedIds` is bounded and advisory.
+
+Hints never assert a result. `platform-sync` carries the store's reported
+`platformCode`, `syncState`, `syncDate`, and `syncGameCount` and only makes the
+shell observe the existing sync earlier; completion still requires a fresh
+`syncDate` with `syncState` `SYNC_SUCCESS` from
+`account.connections.sync.status`. A hint that arrives while its account is no
+longer current is discarded, and a subscription never serves another account's
+registration.
+
+Push registration state is per account and stored in the OS credential store. No token, key,
+or message body is written to settings, diagnostics, or logs. The subscriber
+uses only deadline-bounded network operations, and a configuration change,
+sign-out, or account switch retires the current subscription before another one
+starts. Every registration stage is guarded between requests, so a retired scope
+or shutdown stops the remaining stages after at most one in-flight request
+deadline.
+
+A refused MCS login (a non-zero `LoginResponse.error.code`) is a session failure, not a
+credential verdict: it triggers one bounded registration refresh that keeps the stored device
+identity and replaces only the registration keys and tokens. A `LoginResponse` that carries a
+zero error code is accepted as a successful login. The device identity is replaced only when the
+check-in authority rejects it with HTTP 400 or 401.
+
+Every received frame counts toward the `last_stream_id_received` the session advertises. The
+session acknowledges incoming heartbeat pings, answers an immediate-ack data message or every
+ten unacknowledged persistent messages with an IQ stream acknowledgement (`extension id` 13),
+and honours the heartbeat interval the server negotiates through `LoginResponse.heartbeat_config`
+within bounded limits. A heartbeat that stays unanswered past the acknowledgement deadline, or a
+login request without a response within its deadline, ends the session so the owner reconnects
+with the stored registration rather than holding a half-open connection.
+
+Encrypted bodies are selected the way the maintained client selects them: a declared
+`content-encoding` of `aes128gcm` uses the RFC 8291 body header (salt, record size, key id),
+`aesgcm` uses the legacy `Crypto-Key`/`Encryption` headers, any other declared value is
+rejected, and an absent declaration falls back to the legacy headers when both are present and
+to the RFC 8291 body otherwise. This follows Chromium's
+`components/gcm_driver/crypto/gcm_encryption_provider.cc`, where `content-encoding` is the
+`kContentEncodingProperty` discriminator and the legacy path is keyed on the presence of both
+`Encryption` and `Crypto-Key`. No ciphertext shape is guessed: an unsupported declaration is an
+error, not a heuristic.
+
+Live delivery remains unverified. The subscriber ships complete in code with the bundled default
+and is covered by fixtures, but no live Google check-in, c2dm, FIS, FCM, PNS, or end-to-end
+encrypted delivery has been exercised, and hardware and account-backed validation are out of
+scope for the fixture path.
+
+### Catalog page and metadata capabilities
+
+Protocol 4 requires `catalog.libraryPages.v1`, `catalog.metadata.v1`,
+`account.syncObservation.v1`, and `catalog.languages.v1` in the core handshake.
+The Qt client and both relocated package probes check these capabilities.
+The JSON envelope and native streaming ABI do not change.
+
+`catalog.library.list` accepts `limit` from 1 to 100, an opaque `cursor` up to
+4,096 bytes, and a `traversalId` up to 256 bytes. Continuations must carry the
+`catalogRevision` and opaque `catalogContext` returned by the first page. The context binds the cursor to the provider, account, generation, endpoint, resolved VPC, proxy route and locale. Results contain `games`, `count`,
+nullable `totalCount`, `hasNextPage`, `nextCursor`, `fetchedAt`, `freshness`,
+`traversalId`, `catalogRevision`, `catalogContext`, and the authenticated `scope`. One result is
+at most 768 KiB. Oversized pages are retried at the same cursor with a smaller
+count; a record that cannot fit is an error. Invalid identities or missing
+pagination state are errors, not an empty complete library.
+
+CatalogState stages these pages and detects cursor cycles. A complete library
+means the traversal reached a validated end; it does not imply a transactional
+snapshot of concurrently changing vendor data. Refresh preserves the previous
+complete snapshot until the new traversal ends. The foreground slice is 30
+seconds, with an explicit Continue action. The hard aggregate bounds are 20,000
+games and 32 MiB of conservative serialized-size accounting. Partial/error
+results retain usable data, the failed cursor where safe, and the error text.
+`catalogLastCompleteAt` changes only when the aggregate traversal completes.
+
+`catalog.game.get` accepts exactly one `appId` or `variantId`. The former is a
+parent LCARS string; the latter must fit a positive GraphQL `Int`. The request
+selects library-aware metadata and verifies the returned identity. It always
+revalidates rather than authorizing from cached browse cards. The result has
+`game`, `catalogRevision`, `scope`, `fetchedAt`, and `freshness`.
+
+Game variants retain nullable `librarySelected`, `libraryStatus`, `playStatus`,
+`installed`, `subscription`, `gfnStatus`, `stateDetails`, `paymentModels`,
+`subscriptions`, and `supportedLanguages`. Patch details distinguish automatic
+patches, manual patches, maintenance, and unknown types. Games retain app-level
+`favorited`, `catalogSkuStrings`, `campaignIds`, and fallback `paymentModels`.
+App availability, favorites, payment models, and GFN membership do not establish
+ownership of another variant. Visible detail metadata refreshes every 30 seconds;
+patch duration history is an estimate, not a promised completion time.
+
+`catalog.definitions.get` returns independently fetched `stores`, `genres`, and
+`subscriptions` sections. Each section has `items`, `source`, `status`,
+`freshness`, `fetchedAt`, `expiresAt`, and nullable `error`. Static definitions
+expire after 24 hours. Store definitions retain the feature union and per-variant
+linking metadata. They drive account rows and allowed actions. Unknown stores
+are display-only; unavailable definitions use labelled, action-disabled fallback
+rows. A current server `supported:false` overrides older capability data.
+Store subscription IDs are separate from MES/GFN membership.
+
+`catalog.store.presentation` retains parsed filter expressions and `sortOrders`.
+`catalog.store.list` can receive a `filterId` or `sortId`; the core resolves these
+to the returned server expressions rather than sending an ID as a filter object.
+`revalidate:true` invalidates only the addressed page key; use it for an explicit
+search submission rather than `refresh:true`, which resets a browse chain.
+Local Store facets remain local. `catalog.store.local` returns
+`localHasNextPage`, `cacheComplete`, `upstreamCoverage`, and `facetsSource`
+alongside its existing demand-driven cursor. Local exhaustion does not prove
+upstream coverage. Browse disk pages expire after 15 minutes, and explicit local
+refresh first revalidates the upstream first page before rebuilding the index.
+Confirmed account changes persist an increasing catalog revision, so old pages cannot join
+a new traversal or reappear after a core restart. Failure to persist the revision is an explicit cache-invalidation error, not completion. Cache identities include provider/account, generation,
+endpoint, resolved VPC, proxy route, locale and schema revision.
+
+### Store synchronization observation
+
+`account.connections.sync` sends one ALS POST and accepts only HTTP 202. It
+returns `operationId`, `provider`, and a local `phase`. Repeated starts for the
+same active provider return the existing operation instead of repeating POST.
+There are at most eight account-scoped operations. Mutating requests are never
+automatically replayed after a 401, timeout, cancellation, or ambiguous send.
+
+`account.connections.sync.status` accepts `operationId`. Each poll reads fresh
+`userAccount` at most once. Calls are spaced at two seconds initially and five
+seconds after 20 seconds, with a 120-second observation deadline. The operation
+records the baseline date and state. Only a changed valid RFC3339 `syncDate`
+with `SYNC_SUCCESS` enters `refreshing_library`; unchanged old success, an
+unchanged old failure, and changed counts alone do not prove completion. New
+failure, disconnection, and expiry enter `failed`. Missing completion evidence
+ends as `timed_out`, meaning completion is unconfirmed.
+
+After `refreshing_library`, Qt starts the final library traversal. Only a
+complete traversal displays completion and acknowledges it with
+`sync.status({operationId, libraryRefreshed:true})`. Partial refresh retains a
+separate incomplete notice. `account.connections.sync.cancel` stops observation,
+not accepted remote work. Account/provider generation changes clear pending
+work; late results cannot complete another account's operation. Polls do not
+sleep across their observation lifetime or hold authentication or scheduler
+locks across HTTP. Link callbacks and unlink acknowledgements require a fresh
+account read before claiming the connection changed.
+
+### Overall supported game languages
+
+`catalog.languages.get({refresh:false})` works without sign-in. Its anonymous
+HTTP document is exactly `{ overallGfnSupportedLanguages { language } }`.
+There are no variables and no Authorization header. It returns exact wire IDs
+in `languages`, `status` (`success`, `stale`, or `error`), `source`, cache timing,
+nullable `error`, and `scopeGeneration`. The bounded cache is shared with the
+existing disk-cache owner, keyed separately by public endpoint, provider context,
+and proxy route. Its TTL is 14 days. At most 512 safe IDs of 64 bytes are accepted;
+duplicate IDs are removed without normalization. Invalid or empty metadata does
+not replace a previous good list. Failure with a previous list is explicitly
+stale; failure without one has an empty list and error status. This reference
+data does not select the interface locale, keyboard map, or a game's preferences.
+
+### Independent language preferences and settings choices
+
+`appLanguage` defaults to `system` and selects a bundled Qt interface locale.
+`gameLanguage` defaults to `en_US`; `keyboardLayout` defaults to `en-US`.
+Changing one does not change either of the others. Game language identifiers
+retain exact case, separators, script, and numeric-region subtags. They have an
+ASCII alphabetic first subtag of 2–8 bytes, subsequent alphanumeric subtags of
+1–8 bytes separated by `_` or `-`, and a total limit of 64 bytes. `auto` and
+`system` are rejected, case-insensitively. Safe future IDs need not appear in
+current metadata to remain saved.
+
+`settings.get` returns `keyboardLayouts` beside `settings`, never inside the
+persisted values. Each descriptor has `value`, `label`, and `aliases`. The table
+in `language.rs` is the authority for the supported Windows-rig keyboard subset
+on all Qt platforms. Historical `ja-JP` and `Japanese106` request `ja-106`;
+historical `es-ES` requests `es-ES_tradnl`. Valid saved aliases retain their
+original spelling on disk. This does not select proprietary Mac keyboard IDs.
+New unrecognized keyboard values and malformed game IDs return `invalid_setting`.
+Restored strings remain visible, but a shared request resolver replaces corrupt
+game or keyboard values with the existing respective defaults before create,
+immediate resume, or claim requests. The interface locale never enters these
+query parameters.
+
+`settings.choices.get({runtimeCapabilities})` also returns `frameRates` for the documented
+frame-rate tiers, using the same `value`, `disabled`, and nullable `reason` descriptor shape.
+The conditional top tier reports a reason for each unconfirmed condition: a resolution outside
+full HD, an unreported capability probe, or a reported probe without a hardware decoder for the
+selected codec. Missing or unreported capabilities never imply support, and only rates at or
+below 240 FPS are unconditional. The entitlement limit stays a Qt-side decision because the
+core holds no subscription data.
+
+`settings.choices.get({runtimeCapabilities})` returns `colorQualities` for the current
+persisted settings and embedded streamer capability snapshot. Each of the four
+descriptors contains `value`, `disabled`, and nullable `reason`. The operation
+calls the same profile validator as final launch, including backend, codec,
+HDR, and chroma restrictions. Missing or incompatible capabilities do not imply
+support. This read does not persist or coerce any setting. Protocol 5 and native
+streamer protocol 7 are unchanged.
+
+CoreClient injects the current native window's `nativeHdrSupported` into
+`runtimeCapabilities`, overriding any caller-supplied flag, just as it does for
+`session.create` and `streamer.prepare`. It injects `nativeHdrDisplay` alongside it only
+when the output reported a validated luminance range, so an unavailable snapshot is
+omitted rather than sent as zero. SettingsState observes
+`HdrOutput.supported` only to cancel and refetch choices when the display changes;
+it does not author the wire capability or expose platform handles.
+
+Qt `SettingsState` owns shared desktop/console choices and the single lazy
+language request. Settings entry loads idle or expired metadata. Explicit retry
+sets `refresh:true`; there is no retry loop. Requests have a 15-second deadline.
+Readiness, account/provider generation, or proxy changes clear request ownership
+before cancellation and discard old metadata, but preserve saved preferences.
+Only a response for the current request and generation is accepted. `cacheHit`,
+stale/error status, saved IDs absent from metadata, and local fallback choices
+remain distinguishable. Language and profile edits serialize per key and become
+selected only after persistence succeeds; older failures cannot roll back a
+newer successful edit. These local settings operations do not restart media.

@@ -13,6 +13,7 @@ getrandom.workspace = true
 ghash.workspace = true
 hmac.workspace = true
 mtu.workspace = true
+opennow-streamer-hid = { path = "../opennow-streamer-hid" }
 opennow-streamer-protocol = { path = "../opennow-streamer-protocol" }
 serde_json.workspace = true
 sha1.workspace = true
@@ -22,7 +23,7 @@ thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 str0m = { workspace = true, features = ["wincrypto-dimpl"] }
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_System_IO"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Keep transport crypto architecture-independent. The Apple/Swift provider's
@@ -35,3 +36,11 @@ str0m = { workspace = true, features = ["rust-crypto"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+
+[features]
+sony-peer-probe = []
+
+[[bin]]
+name = "nvst-peer-probe"
+path = "src/bin/nvst_peer_probe.rs"
+required-features = ["sony-peer-probe"]

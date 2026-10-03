@@ -34,6 +34,9 @@ QtObject {
     property Component pageComponent: Component {
         DesktopSettingsRecordingPage { availableWidth: 960; settingsScreen: fixture }
     }
+    property Component shortcutsComponent: Component {
+        DesktopSettingsShortcutsPage { availableWidth: 960; settingsScreen: fixture }
+    }
     property Component bindingComponent: Component { DesktopSettingsShortcutBinding {} }
     property Component statusComponent: Component { StreamCaptureStatus {} }
     function boolSetting(key, fallback) { return ShellStore.settings[key] ?? fallback }
@@ -62,8 +65,15 @@ QtObject {
         check(find(page, "replayBufferMemoryChoice").value === 256, "default memory limit")
         find(page, "recordingStreamSettings").clicked()
         check(selectedSection === 3, "source settings must link to Stream")
-        check(find(page, "editRecordingShortcut").text === "F12", "recording binding must be visible")
-        check(find(page, "editSaveClipShortcut").text === "Ctrl+F12", "clip binding must be visible")
+        check(find(page, "recordingShortcutHint").keyText === "F12", "recording binding must be visible")
+        check(find(page, "replayShortcutHint").keyText === "Ctrl+F12", "clip binding must be visible")
+        find(page, "recordingKeyboardShortcuts").clicked()
+        check(selectedSection === 10, "capture shortcut editing must link to the central shortcuts page")
+        const shortcuts = shortcutsComponent.createObject(parent)
+        check(shortcuts !== null, "central shortcut settings must load")
+        const editableBindings = shortcuts.allShortcutGroups().reduce((keys, group) => keys.concat(group.rows.map(row => row.setting)), [])
+        check(["shortcutToggleStats", "shortcutToggleRecording", "shortcutSaveClip"].every(key => editableBindings.indexOf(key) >= 0),
+            "statistics and capture bindings must remain editable in the central shortcut settings")
         const binding = bindingComponent.createObject(parent)
         const status = statusComponent.createObject(parent)
         ShellStore.streamRecordingElapsedMs = 65000
@@ -80,7 +90,19 @@ QtObject {
         check(binding.validate("shortcutSaveClip", {key: Qt.Key_F12, modifiers: Qt.ControlModifier}).chord === "Ctrl+F12", "clip default must validate")
         check(binding.validate("shortcutSaveClip", {key: Qt.Key_F12, modifiers: Qt.NoModifier}).error, "recording collision must be rejected")
         check(binding.validate("shortcutSaveClip", {key: Qt.Key_G, modifiers: Qt.ControlModifier}).error, "Guide is reserved")
-        check(binding.validate("shortcutSaveClip", {key: Qt.Key_F3, modifiers: Qt.NoModifier}).error, "stats alias is reserved")
+        check(binding.validate("shortcutSaveClip", {key: Qt.Key_F3, modifiers: Qt.NoModifier}).chord === "F3", "F3 must be available for gameplay or a custom binding")
+        ShellStore.applySetting("shortcutToggleStats", "")
+        ShellStore.applySetting("shortcutToggleRecording", "")
+        ShellStore.applySetting("shortcutSaveClip", "")
+        check(binding.value("shortcutToggleStats") === "" && binding.value("shortcutToggleRecording") === "", "cleared shortcuts must not inherit defaults")
+        check(!ShellStore.streamShortcutBindings()["toggle-recording"][0]
+            && !ShellStore.streamShortcutBindings()["save-clip"][0], "cleared capture bindings must reach the video item")
+        check(shortcuts.allShortcutGroups()[0].rows.find(row => row.setting === "shortcutToggleRecording").k === qsTr("Not set"), "central shortcuts page must show a cleared binding")
+        check(!find(page, "recordingShortcutHint").visible && !find(page, "replayShortcutHint").visible, "recording page must not advertise disabled shortcuts")
+        ShellStore.applySetting("shortcutToggleStats", "Ctrl+N")
+        ShellStore.applySetting("shortcutToggleRecording", "F12")
+        ShellStore.applySetting("shortcutSaveClip", "Ctrl+F12")
+        shortcuts.destroy()
         ShellStore.applyStreamShortcutAction("save-clip")
         check(client.calls.length === 0, "disabled shortcut must not request a file")
         toggle.clicked()

@@ -12,6 +12,13 @@ ApplicationWindow {
     visibility: ApplicationWindow.Windowed
     color: "black"
     title: qsTr("OpenNOW")
+    property bool applicationCloseConfirmed: false
+    onClosing: event => {
+        if (!applicationCloseConfirmed) {
+            event.accepted = false
+            AppController.showOverlay("application-quit-confirm")
+        }
+    }
 
     Component { id: hdrPopupEffect; HdrChromeEffect {} }
     Binding { target: window.Overlay.overlay.layer; property: "enabled"; value: HdrOutput.chromeRequired }
@@ -20,6 +27,8 @@ ApplicationWindow {
     property string activeRoute: AppController.route
     readonly property var frameGenerationStats: activeRoute === "stream" && routeLoader.item
         ? (routeLoader.item.frameGenerationStats || ({})) : ({})
+    readonly property var swapStats: activeRoute === "stream" && routeLoader.item
+        ? (routeLoader.item.swapStats || ({})) : ({})
     readonly property string frameGenerationStatus: String(frameGenerationStats.status || "")
     readonly property string frameGenerationDiagnosticKey: [frameGenerationStatus,
         frameGenerationStats.timingSource || "none", frameGenerationStats.rejectionReason || "none",
@@ -65,7 +74,7 @@ ApplicationWindow {
     property int visibilityBeforeSession: ApplicationWindow.Windowed
     property int fullscreenRestoreVisibilityBeforeSession: ApplicationWindow.Windowed
     readonly property string configuredStatsShortcut: String(
-        ShellStore.settings.shortcutToggleStats || "Ctrl+N")
+        ShellStore.settings.shortcutToggleStats ?? "Ctrl+N")
     readonly property bool streamStatsShortcutEnabled: activeRoute === "stream"
         && (AppController.overlay === ""
             || AppController.overlay === "desktop-stream-menu"
@@ -168,6 +177,7 @@ ApplicationWindow {
 
     function syncInputOwnership() {
         const shellOwnsInput = !window.active || AppController.route !== "stream"
+            || (window.desktopSurfaceActive && !ShellStore.authRestorePending && !ShellStore.signedIn)
             || ShellStore.streamOverlayBlocksGameplayInput(AppController.overlay)
         ControllerInput.inputSuspended = !window.active
             || (shellOwnsInput && ShellStore.settings.controllerMode === false)
@@ -191,24 +201,12 @@ ApplicationWindow {
         value: Number(ShellStore.settings.controllerVibrationIntensity ?? 100)
     }
 
-    // StreamVideoItem normally owns gameplay keys, but fullscreen transitions
-    // can briefly leave the Qt focus chain without an active item. Register the
-    // shell-owned stats shortcuts at application scope so F3 never leaks to the
-    // remote game or depends on item focus.
-    Shortcut {
-        objectName: "streamStatsShortcut"
-        sequence: "F3"
-        context: Qt.ApplicationShortcut
-        enabled: window.streamStatsShortcutEnabled
-        onActivated: ShellStore.applyStreamShortcutAction("toggle-stats")
-    }
     Shortcut {
         objectName: "configuredStreamStatsShortcut"
         sequence: window.configuredStatsShortcut
         context: Qt.ApplicationShortcut
         enabled: window.streamStatsShortcutEnabled
             && window.configuredStatsShortcut !== ""
-            && window.configuredStatsShortcut.toUpperCase() !== "F3"
         onActivated: ShellStore.applyStreamShortcutAction("toggle-stats")
     }
     Shortcut {
@@ -221,10 +219,11 @@ ApplicationWindow {
     }
     Shortcut {
         objectName: "streamMicrophoneShortcut"
-        sequence: String(ShellStore.settings.shortcutToggleMicrophone || "Ctrl+Shift+M")
+        sequence: String(ShellStore.settings.shortcutToggleMicrophone ?? "Ctrl+Shift+M")
         context: Qt.ApplicationShortcut
         autoRepeat: false
         enabled: window.activeRoute === "stream" && ShellStore.microphoneToggleAvailable
+            && sequence !== ""
         onActivated: ShellStore.toggleMicrophone()
     }
 
@@ -337,7 +336,7 @@ ApplicationWindow {
             window.lockedStreamDesktopSurface = !enabled
             window.streamSurfaceLocked = true
         }
-        if (ShellStore.signedIn && AppController.route === "sign-in")
+        if (ShellStore.signedIn && !ShellStore.addingAccount && AppController.route === "sign-in")
             AppController.navigate("home")
         window.synchronizeRenderedSurface()
     }
@@ -404,7 +403,8 @@ ApplicationWindow {
             if (!window.streamSurfaceLocked)
                 window.lockedStreamDesktopSurface = window.desktopSurfaceActive
             window.streamSurfaceLocked = true
-        } else {
+        } else if (!ShellStore.activeSession
+                   || ["sign-in", "accounts", "profile-pin"].indexOf(window.activeRoute) < 0) {
             window.streamSurfaceLocked = false
         }
         window.synchronizeRenderedSurface()
@@ -560,6 +560,7 @@ ApplicationWindow {
 
         Connections {
             target: AppController
+            function onApplicationExitCommitted() { window.applicationCloseConfirmed = true }
             function onRouteChanged() {
                 window.updateSessionWindowMode()
                 window.updateStreamSurfaceLock()
@@ -588,6 +589,9 @@ ApplicationWindow {
         }
         Connections {
             target: ShellStore
+            function onActiveSessionChanged() { window.updateStreamSurfaceLock() }
+            function onSignedInChanged() { window.syncInputOwnership() }
+            function onAuthRestorePendingChanged() { window.syncInputOwnership() }
             function onStreamerChanged() { window.showConfiguredStreamStats() }
             function onConsoleSurfaceRequested(enabled) { window.applyConsoleSurface(enabled) }
             function onOnboardingCompleted() {
@@ -610,7 +614,10 @@ ApplicationWindow {
                 event.accepted = true
                 return
             }
-            if (event.key === Qt.Key_F11 && window.activeRoute === "stream") {
+            if (event.key === Qt.Key_F11 && window.activeRoute === "stream"
+                    && (ShellStore.settings.shortcutToggleFullscreen ?? "F11") === "F11"
+                    && (event.modifiers & (Qt.ControlModifier | Qt.ShiftModifier
+                        | Qt.AltModifier | Qt.MetaModifier)) === Qt.NoModifier) {
                 window.toggleFullscreen()
                 event.accepted = true
             } else if (event.key === Qt.Key_F10) {
@@ -668,11 +675,13 @@ ApplicationWindow {
 
     DesktopStreamOverlayHost {
         id: desktopStreamOverlay
-        notificationsEnabled: window.desktopSurfaceActive && window.activeRoute === "stream"
+        notificationsEnabled: window.activeRoute === "stream"
+        connectionNotificationsEnabled: window.desktopSurfaceActive
         layer.enabled: HdrOutput.chromeRequired
         layer.effect: HdrChromeEffect {}
         anchors.fill: parent
         frameGenerationStats: window.frameGenerationStats
+        swapStats: window.swapStats
         pointerLocked: window.activeRoute === "stream" && routeLoader.item
             && routeLoader.item.streamPointerLocked === true
         overlay: AppController.overlay
@@ -682,6 +691,21 @@ ApplicationWindow {
         z: 1100
         onVisibleChanged: if (visible && inputBlocking) forceActiveFocus()
         onInputBlockingChanged: if (visible && inputBlocking) forceActiveFocus()
+    }
+
+    DesktopStreamExitConfirm {
+        objectName: "applicationQuitConfirmation"
+        anchors.fill: parent
+        layer.enabled: HdrOutput.chromeRequired
+        layer.effect: HdrChromeEffect {}
+        quittingApplication: true
+        opened: AppController.overlay === "application-quit-confirm"
+        z: 1200
+        onCancelRequested: AppController.showOverlay("")
+        onConfirmRequested: {
+            window.applicationCloseConfirmed = true
+            window.close()
+        }
     }
 
     Rectangle {
@@ -723,7 +747,7 @@ ApplicationWindow {
         PauseAnimation { duration: AppController.reducedMotion ? 0 : 160 }
         ScriptAction {
             script: {
-                if (ShellStore.signedIn && AppController.route === "sign-in")
+                if (ShellStore.signedIn && !ShellStore.addingAccount && AppController.route === "sign-in")
                     AppController.navigate("home")
             }
         }
@@ -829,6 +853,14 @@ ApplicationWindow {
                     accessibilityAnnouncer.announce(qsTr("Error: %1").arg(ShellStore.lastError), true)
             }
         }
+    }
+
+    UpdateFailureDialog {
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        failureMessage: ShellStore.updaterFailureMessage
+        sessionSafe: ShellStore.updaterSessionSafe
+        onDismissed: ShellStore.updaterFailureMessage = ""
     }
 
     Component { id: desktopAppScreen; DesktopApp {} }

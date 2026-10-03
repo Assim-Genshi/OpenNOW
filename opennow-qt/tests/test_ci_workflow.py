@@ -17,6 +17,16 @@ def jobs(workflow):
 
 
 class CIWorkflowTest(unittest.TestCase):
+    def test_stack_base_branches_run_pr_checks_without_new_push_or_publication_triggers(self):
+        ci = (WORKFLOWS / "qt-ci.yml").read_text()
+        pull = ci.split("  pull_request:\n", 1)[1].split("  push:\n", 1)[0]
+        push = ci.split("  push:\n", 1)[1].split("\nconcurrency:", 1)[0]
+        for branch in ("capy/explain-cloud-session-setup", "capy/gfn-correctness/**"):
+            self.assertIn(f"      - {branch}\n", pull)
+            self.assertNotIn(branch, push)
+        self.assertNotIn("pull_request_target:", ci)
+        self.assertIn("github.event_name == 'workflow_dispatch'", jobs(ci)["publish-nightly"])
+
     def test_linux_appimages_deploy_wayland_platform_and_shell_plugins(self):
         for name in ("qt-build.yml", "qt-release-candidate.yml"):
             with self.subTest(workflow=name):
@@ -178,9 +188,13 @@ class CIWorkflowTest(unittest.TestCase):
         self.assertIn("ensure-windows-media-foundation.ps1", checks)
         cmake = (ROOT / "opennow-qt/cmake/Tests.cmake").read_text()
         targets = re.search(r"set\(OPENNOW_CI_UNIT_TEST_TARGETS\s+(.*?)\)", cmake, re.DOTALL)[1].split()
-        self.assertEqual(len(targets), 28)
-        self.assertEqual(len(set(targets)), 28)
+        self.assertEqual(len(targets), 31)
+        self.assertEqual(len(set(targets)), 31)
+        self.assertIn("opennow-updatefailure-tests", targets)
+        self.assertIn('add_test(NAME opennow-updatefailure-tests COMMAND opennow-updatefailure-tests', cmake)
+        self.assertIn('-input "${CMAKE_CURRENT_SOURCE_DIR}/tests/qml-updater"', cmake)
         self.assertIn("opennow-applicationicons-tests", targets)
+        self.assertIn("opennow-streampresenttimings-tests", targets)
         self.assertIn("opennow-fsrupscaler-tests", targets)
         self.assertRegex(cmake, r'if\(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"\)\s+'
                          r'set_tests_properties\(opennow-frameinterpolator-tests opennow-fsrupscaler-tests\s+'
@@ -194,6 +208,7 @@ class CIWorkflowTest(unittest.TestCase):
         self.assertIn("opennow-controllericons-tests", targets)
         self.assertIn("opennow-streamtoasts-tests", targets)
         self.assertIn("opennow-waylandhdroutput-tests", targets)
+        self.assertIn("opennow-queueselector-tests", targets)
         for forbidden in ("opennow-qt", "opennow-streamvideo-tests", "opennow-nativestreamruntime-tests",
                           "opennow-nativeframegeneration-tests", "opennow-linuxvulkangraphics-tests"):
             self.assertNotIn(forbidden, targets)
@@ -288,6 +303,31 @@ class CIWorkflowTest(unittest.TestCase):
         tests = (ROOT / "opennow-qt/cmake/Tests.cmake").read_text()
         self.assertIn("set_property(TARGET opennow-hdrcolor-tests PROPERTY MSVC_DEBUG_INFORMATION_FORMAT Embedded)", tests)
         self.assertIn("target_compile_options(opennow-hdrcolor-tests PRIVATE /Zi)", tests)
+
+    def test_package_compile_caches_restore_their_own_timestamped_entries(self):
+        for workflow_name, job_names in (
+            ("qt-build.yml", ("packages",)),
+            ("qt-release-candidate.yml", ("linux", "windows", "macos")),
+        ):
+            workflow_jobs = jobs((WORKFLOWS / workflow_name).read_text())
+            for job_name in job_names:
+                with self.subTest(workflow=workflow_name, job=job_name):
+                    cache = workflow_jobs[job_name].split("uses: hendrikmuhs/ccache-action@", 1)[1].split("\n      -", 1)[0]
+                    key = re.search(r"^\s+key: (.+)$", cache, re.MULTILINE).group(1)
+                    self.assertIn(f"restore-keys: {key}\n", cache)
+                    self.assertIn("verbose: 1", cache)
+                    self.assertNotIn("append-timestamp: false", cache)
+
+    def test_relocated_core_probe_matches_shell_protocol(self):
+        header = (ROOT / "opennow-qt/src/core/CoreClient.h").read_text()
+        version = int(re.search(r"CurrentProtocolVersion = (\d+);", header).group(1))
+        core = (ROOT / "native/opennow-core/src/main.rs").read_text()
+        self.assertEqual(int(re.search(r"const PROTOCOL_VERSION: i64 = (\d+);", core).group(1)), version)
+        for name in ("qt-build.yml", "qt-release-candidate.yml"):
+            with self.subTest(workflow=name):
+                workflow = (WORKFLOWS / name).read_text()
+                probe = workflow.split('"id":"package-core"', 1)[1].split("core.stdin.flush()", 1)[0]
+                self.assertEqual(int(re.search(r'"protocolVersion":(\d+)', probe).group(1)), version)
 
     def test_publishing_remains_explicitly_opt_in_after_build(self):
         ci = (WORKFLOWS / "qt-ci.yml").read_text()

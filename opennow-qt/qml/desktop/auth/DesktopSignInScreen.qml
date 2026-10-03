@@ -15,8 +15,8 @@ FocusScope {
     property double clockMs: Date.now()
     property double challengeReceivedAt: Date.now()
     readonly property var challenge: ShellStore.authChallenge
-    readonly property var providers: ShellStore.providers && ShellStore.providers.length
-        ? ShellStore.providers : [{displayName:"NVIDIA · GeForce NOW", idpId:"", region:"GLOBAL"}]
+    readonly property var providers: ShellStore.providers || []
+    readonly property var selectedProvider: ShellStore.selectedProvider || {displayName:qsTr("Select a provider"), idpId:ShellStore.selectedProviderIdpId, region:""}
     readonly property bool waiting: ShellStore.authState === "starting" || ShellStore.authState === "waiting" || ShellStore.authState === "completing"
     readonly property bool failed: ShellStore.authState === "error"
     readonly property bool wideLayout: width >= DesktopTokens.px(1240)
@@ -168,16 +168,7 @@ FocusScope {
             x: DesktopTokens.px(root.wideLayout ? 40 : 24)
             anchors.verticalCenter: parent.verticalCenter
             spacing: DesktopTokens.px(10)
-            DesktopOnboardingMark { anchors.verticalCenter: parent.verticalCenter; width: DesktopTokens.px(26); height: DesktopTokens.px(16) }
-            BodyText {
-                anchors.verticalCenter: parent.verticalCenter
-                text: "OpenNOW"
-                color: DesktopTokens.text
-                font.pixelSize: DesktopTokens.px(18)
-                font.weight: Font.Black
-                font.letterSpacing: -0.36 * DesktopTokens.uiScale
-                lineHeight: DesktopTokens.px(22)
-            }
+            DesktopBrandLockup { anchors.verticalCenter: parent.verticalCenter }
             Row {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: DesktopTokens.px(6)
@@ -222,7 +213,7 @@ FocusScope {
             HeaderLink {
                 text: qsTr("Privacy")
                 explanation: qsTr("OpenNOW never sees your password. Sign-in happens on your provider's own page and only a session token comes back.")
-                    + "\n\n" + qsTr("The refresh token is encrypted with the OS keychain.")
+                    + "\n\n" + qsTr("OpenNOW prefers the OS keychain for saved session tokens. If it is unavailable, tokens are saved unencrypted on disk.")
             }
         }
     }
@@ -242,96 +233,14 @@ FocusScope {
 
         Item {
             id: body
-            x: root.wideLayout ? DesktopTokens.px(80) : (viewport.width - width) / 2
-            y: Math.max(DesktopTokens.px(24), (viewport.height - height) / 2)
-            width: root.wideLayout ? viewport.width - DesktopTokens.px(176) : Math.max(0, Math.min(DesktopTokens.px(440), viewport.width - DesktopTokens.px(48)))
-            height: Math.max(card.height, root.wideLayout ? hero.implicitHeight : 0)
-
-            Column {
-                id: hero
-                visible: root.wideLayout
-                width: DesktopTokens.px(560)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: DesktopTokens.px(24)
-                Rectangle {
-                    width: DesktopTokens.px(72)
-                    height: DesktopTokens.px(72)
-                    radius: DesktopTokens.px(20)
-                    color: Theme.lightMode ? Theme.shell : "#0B0F1A"
-                    border.width: 1
-                    border.color: root.cardSeam
-                    layer.enabled: true
-                    layer.effect: MultiEffect {
-                        shadowEnabled: true
-                        shadowColor: "#186EE7B7"
-                        shadowBlur: 1
-                        shadowVerticalOffset: 0
-                        shadowHorizontalOffset: 0
-                    }
-                    DesktopOnboardingMark { anchors.centerIn: parent; width: DesktopTokens.px(40); height: DesktopTokens.px(26) }
-                }
-                Column {
-                    width: parent.width
-                    spacing: DesktopTokens.px(14)
-                    BodyText {
-                        width: parent.width
-                        text: qsTr("Your GeForce NOW,\nwithout the browser.")
-                        color: DesktopTokens.text
-                        font.family: DesktopTokens.displayFont
-                        font.pixelSize: DesktopTokens.px(56)
-                        font.weight: Font.Black
-                        font.letterSpacing: -1.68 * DesktopTokens.uiScale
-                        lineHeight: DesktopTokens.px(60)
-                        topPadding: -DesktopTokens.px(9)
-                    }
-                    BodyText {
-                        width: DesktopTokens.px(500)
-                        text: qsTr("OpenNOW is a native client for GeForce NOW and its alliance partners. Sign in with your provider to access your library, browse the stores and connect with friends.")
-                        font.pixelSize: DesktopTokens.px(16)
-                        lineHeight: DesktopTokens.px(25)
-                    }
-                }
-                Row {
-                    width: parent.width
-                    spacing: DesktopTokens.px(36)
-                    topPadding: DesktopTokens.px(8)
-                    Column {
-                        width: DesktopTokens.px(130)
-                        spacing: DesktopTokens.px(4)
-                        MonoText { text: qsTr("Native Qt"); color: DesktopTokens.text; font.pixelSize: DesktopTokens.px(24); font.letterSpacing: 0; lineHeight: DesktopTokens.px(28) }
-                        BodyText { width: parent.width; text: qsTr("Native Qt shell, no Chromium"); color: root.mutedInk; font.pixelSize: DesktopTokens.px(12); lineHeight: DesktopTokens.px(16) }
-                    }
-                    Rectangle { width: 1; height: DesktopTokens.px(44); color: root.cardSeam }
-                    Column {
-                        width: DesktopTokens.px(108)
-                        spacing: DesktopTokens.px(4)
-                        MonoText { text: qsTr("Library"); color: DesktopTokens.text; font.pixelSize: DesktopTokens.px(24); font.letterSpacing: 0; lineHeight: DesktopTokens.px(28) }
-                        BodyText { width: parent.width; text: qsTr("Your games, in one place"); color: root.mutedInk; font.pixelSize: DesktopTokens.px(12); lineHeight: DesktopTokens.px(16) }
-                    }
-                    Rectangle { width: 1; height: DesktopTokens.px(44); color: root.cardSeam }
-                    Column {
-                        width: DesktopTokens.px(176)
-                        spacing: DesktopTokens.px(4)
-                        MonoText { text: qsTr("0 passwords"); color: DesktopTokens.text; font.pixelSize: DesktopTokens.px(24); font.letterSpacing: 0; lineHeight: DesktopTokens.px(28) }
-                        BodyText { width: parent.width; text: qsTr("Sign-in happens on your provider's page"); color: root.mutedInk; font.pixelSize: DesktopTokens.px(12); lineHeight: DesktopTokens.px(16) }
-                    }
-                }
-                Row {
-                    width: parent.width
-                    spacing: DesktopTokens.px(10)
-                    topPadding: DesktopTokens.px(4)
-                    Rectangle { anchors.verticalCenter: parent.verticalCenter; width: DesktopTokens.px(8); height: width; radius: width / 2; color: DesktopTokens.amber }
-                    BodyText {
-                        width: parent.width - DesktopTokens.px(18)
-                        text: qsTr("%1 is a beta. We will say more about that right after you sign in.").arg(Qt.application.version || qsTr("OpenNOW"))
-                        color: root.mutedInk
-                    }
-                }
-            }
+            x: (viewport.width - width) / 2
+            y: height <= viewport.height ? (viewport.height - height) / 2 : DesktopTokens.px(24)
+            width: Math.max(0, Math.min(DesktopTokens.px(440), viewport.width - DesktopTokens.px(48)))
+            height: card.height
 
             Rectangle {
                 id: card
-                x: parent.width - width
+                anchors.horizontalCenter: parent.horizontalCenter
                 anchors.verticalCenter: parent.verticalCenter
                 width: Math.min(DesktopTokens.px(440), parent.width)
                 height: cardColumn.implicitHeight + 2
@@ -395,6 +304,24 @@ FocusScope {
                     }
 
                     Column {
+                        x: DesktopTokens.px(26)
+                        width: parent.width - DesktopTokens.px(52)
+                        bottomPadding: DesktopTokens.px(24)
+                        visible: ShellStore.savedAccounts.length > 0
+                        AuthButton {
+                            objectName: "savedAccountsButton"
+                            width: parent.width
+                            enabled: ShellStore.ready
+                            text: qsTr("Saved accounts")
+                            onClicked: {
+                                ShellStore.cancelDeviceLogin()
+                                root.providerOpen = false
+                                AppController.navigate("accounts")
+                            }
+                        }
+                    }
+
+                    Column {
                         id: providerColumn
                         x: DesktopTokens.px(26)
                         width: parent.width - DesktopTokens.px(52)
@@ -402,13 +329,29 @@ FocusScope {
                         bottomPadding: DesktopTokens.px(18)
                         visible: !root.waiting && !root.failed
                         MonoText { text: qsTr("PROVIDER") }
+                        BodyText {
+                            objectName: "providerDiscoveryNotice"
+                            width: parent.width
+                            visible: ShellStore.providerDiscoveryDegraded
+                            text: root.providers.length
+                                ? qsTr("Provider discovery is unavailable. Known providers are shown. Refresh to try again.")
+                                : qsTr("No providers are available. Refresh to try again.")
+                            color: DesktopTokens.textMuted
+                        }
+                        AuthButton {
+                            width: parent.width
+                            visible: ShellStore.providerDiscoveryDegraded
+                            text: qsTr("Refresh providers")
+                            enabled: ShellStore.ready && ShellStore.providersRequestId === ""
+                            onClicked: ShellStore.refreshProviders(true)
+                        }
                         ItemDelegate {
                             id: providerButton
                             focusPolicy: Qt.StrongFocus
                             width: parent.width
                             height: DesktopTokens.px(56)
                             padding: 0
-                            Accessible.name: String(root.providers[0].displayName || "NVIDIA · GeForce NOW")
+                            Accessible.name: String(root.selectedProvider.displayName || "NVIDIA · GeForce NOW")
                             background: Rectangle {
                                 radius: DesktopTokens.px(12)
                                 color: providerButton.hovered || providerButton.activeFocus ? DesktopTokens.raisedStrong : DesktopTokens.raised
@@ -423,15 +366,15 @@ FocusScope {
                                     height: width
                                     radius: DesktopTokens.px(9)
                                     color: "#76B900"
-                                    BodyText { anchors.centerIn: parent; text: "N"; color: "#0B0F1A"; font.pixelSize: DesktopTokens.px(14); font.weight: Font.Black }
+                                    BodyText { anchors.centerIn: parent; text: String(root.selectedProvider.displayName || "").slice(0, 1).toUpperCase(); color: "#0B0F1A"; font.pixelSize: DesktopTokens.px(14); font.weight: Font.Black }
                                 }
                                 Column {
                                     x: DesktopTokens.px(58)
                                     width: parent.width - DesktopTokens.px(100)
                                     anchors.verticalCenter: parent.verticalCenter
                                     spacing: DesktopTokens.px(2)
-                                    BodyText { objectName: "signInProviderName"; width: parent.width; text: String(root.providers[0].displayName || "NVIDIA · GeForce NOW"); color: DesktopTokens.text; font.pixelSize: DesktopTokens.px(14); font.weight: Font.ExtraBold; maximumLineCount: 1; elide: Text.ElideRight }
-                                    MonoText { objectName: "signInProviderRegion"; width: parent.width; text: String(root.providers[0].region || "GLOBAL").toUpperCase() + qsTr("  ·  DEFAULT PROVIDER"); font.letterSpacing: 0.8 * DesktopTokens.uiScale; elide: Text.ElideRight }
+                                    BodyText { objectName: "signInProviderName"; width: parent.width; text: String(root.selectedProvider.displayName || "NVIDIA · GeForce NOW"); color: DesktopTokens.text; font.pixelSize: DesktopTokens.px(14); font.weight: Font.ExtraBold; maximumLineCount: 1; elide: Text.ElideRight }
+                                    MonoText { objectName: "signInProviderRegion"; width: parent.width; text: String(root.selectedProvider.region || "GLOBAL").toUpperCase() + qsTr("  ·  SELECTED PROVIDER"); font.letterSpacing: 0.8 * DesktopTokens.uiScale; elide: Text.ElideRight }
                                 }
                                 DesktopGlyph {
                                     anchors.right: parent.right
@@ -496,7 +439,7 @@ FocusScope {
                                 anchors.verticalCenter: parent.verticalCenter
                                 spacing: DesktopTokens.px(2)
                                 BodyText { width: parent.width; text: qsTr("Stay signed in on this PC"); color: DesktopTokens.text; font.weight: Font.ExtraBold; lineHeight: DesktopTokens.px(17) }
-                                BodyText { width: parent.width; text: qsTr("The refresh token is encrypted with the OS keychain."); color: root.mutedInk; font.pixelSize: DesktopTokens.px(12); lineHeight: DesktopTokens.px(16) }
+                                BodyText { width: parent.width; text: qsTr("OpenNOW prefers the OS keychain for saved session tokens. If it is unavailable, tokens are saved unencrypted on disk."); color: root.mutedInk; font.pixelSize: DesktopTokens.px(12); lineHeight: DesktopTokens.px(16) }
                             }
                             Rectangle {
                                 anchors.right: parent.right
@@ -526,17 +469,17 @@ FocusScope {
                             primary: true
                             external: true
                             font.pixelSize: DesktopTokens.px(14)
-                            text: qsTr("Continue with NVIDIA")
-                            enabled: ShellStore.ready
-                            onClicked: ShellStore.startDeviceLogin(root.providers[0].idpId || "", root.staySignedIn)
+                            text: qsTr("Continue with %1").arg(root.selectedProvider.displayName)
+                            enabled: ShellStore.ready && ShellStore.selectedProvider !== null
+                            onClicked: ShellStore.startDeviceLogin(root.selectedProvider.idpId || "", root.staySignedIn)
                         }
                         AuthButton {
                             width: parent.width
                             glyph: "desktop-qr.svg"
                             glyphSize: DesktopTokens.px(14)
                             text: qsTr("Sign in with a QR code")
-                            enabled: ShellStore.ready
-                            onClicked: { root.qrRequested = true; ShellStore.startDeviceLogin(root.providers[0].idpId || "", root.staySignedIn) }
+                            enabled: ShellStore.ready && ShellStore.selectedProvider !== null
+                            onClicked: { root.qrRequested = true; ShellStore.startDeviceLogin(root.selectedProvider.idpId || "", root.staySignedIn) }
                         }
                     }
 
@@ -706,7 +649,7 @@ FocusScope {
                         Row {
                             width: parent.width
                             spacing: DesktopTokens.px(10)
-                            AuthButton { width: (parent.width - parent.spacing) * 0.55; primary: true; text: qsTr("Try again"); onClicked: { ShellStore.authState = "idle"; ShellStore.startDeviceLogin(root.providers[0].idpId || "", root.staySignedIn) } }
+                            AuthButton { width: (parent.width - parent.spacing) * 0.55; primary: true; text: qsTr("Try again"); onClicked: { ShellStore.authState = "idle"; ShellStore.startDeviceLogin(root.selectedProvider.idpId || "", root.staySignedIn) } }
                             AuthButton { width: (parent.width - parent.spacing) * 0.45; text: qsTr("Choose provider"); onClicked: { ShellStore.authState = "idle"; root.providerOpen = true } }
                         }
                         Rectangle {
@@ -822,7 +765,7 @@ FocusScope {
 
     Connections {
         target: ShellStore
-        function onSignedInChanged() { if (ShellStore.signedIn) root.signedIn() }
+        function onSignedInChanged() { if (ShellStore.signedIn && !ShellStore.addingAccount) root.signedIn() }
         function onAuthChallengeChanged() {
             root.challengeReceivedAt = Date.now()
             root.clockMs = root.challengeReceivedAt

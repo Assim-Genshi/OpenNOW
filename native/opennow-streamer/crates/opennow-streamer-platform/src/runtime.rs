@@ -149,6 +149,10 @@ impl MediaRuntime {
         }
     }
 
+    pub fn graphics_adapters(&self) -> Vec<opennow_streamer_protocol::GraphicsAdapterCapability> {
+        crate::graphics_adapter_capabilities(self.windows_adapter_luid().map(|luid| luid.get()))
+    }
+
     fn windows_adapter_luid(&self) -> Option<crate::WindowsAdapterLuid> {
         match &self.mode {
             MediaRuntimeMode::Embedded { config, .. } => config.windows_adapter_luid,
@@ -213,12 +217,13 @@ impl MediaRuntime {
         let supported = matches!(requested, "auto" | "videotoolbox");
         #[cfg(target_os = "linux")]
         let supported = requested == "auto"
-            || (matches!(requested, "vulkan" | "cuda" | "nvdec" | "vaapi" | "v4l2")
-                && self.video_backends().iter().any(|backend| {
-                    backend.available
-                        && (backend.backend == requested
-                            || (requested == "nvdec" && backend.backend == "cuda"))
-                }));
+            || self.video_backends().iter().any(|backend| {
+                backend.available
+                    && (backend.backend == requested
+                        || (requested == "nvdec" && backend.backend == "cuda")
+                        || (matches!(requested, "software" | "ffmpeg")
+                            && backend.backend == "ffmpeg"))
+            });
         #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
         let supported = requested == "auto";
         if supported {
@@ -667,12 +672,22 @@ impl MainThreadHost {
                     reply,
                 }) => {
                     static SURFACE_LOG_REMAINING: AtomicU64 = AtomicU64::new(12);
-                    if SURFACE_LOG_REMAINING
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                            remaining.checked_sub(1)
-                        })
-                        .is_ok()
-                    {
+                    let mut remaining = SURFACE_LOG_REMAINING.load(Ordering::Relaxed);
+                    let log_surface = loop {
+                        let Some(next) = remaining.checked_sub(1) else {
+                            break false;
+                        };
+                        match SURFACE_LOG_REMAINING.compare_exchange_weak(
+                            remaining,
+                            next,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break true,
+                            Err(current) => remaining = current,
+                        }
+                    };
+                    if log_surface {
                         eprintln!(
                             "NVST surface-update visible={} rect={:?}",
                             new_surface.visible, new_surface.screen_rect
@@ -1986,6 +2001,31 @@ mod tests {
         runtime.shutdown();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn embedded_runtime_accepts_software_only_when_the_cpu_decoder_is_available() {
+        let (_graphics, frames) = crate::RenderThreadGraphics::new(|| {});
+        let runtime = super::create_embedded_runtime(frames);
+        let software_available = runtime
+            .video_backends()
+            .iter()
+            .any(|backend| backend.backend == "ffmpeg" && backend.available);
+        for requested in ["software", "ffmpeg"] {
+            assert_eq!(
+                runtime.validate_backend(requested).is_ok(),
+                software_available,
+                "{requested}"
+            );
+        }
+        for unsupported in ["hardware", "d3d12", "videotoolbox", "invalid"] {
+            assert!(
+                runtime.validate_backend(unsupported).is_err(),
+                "{unsupported}"
+            );
+        }
+        runtime.shutdown();
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn embedded_windows_rejects_unimplemented_backend_overrides() {
@@ -2040,6 +2080,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: true,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::Queued
         );

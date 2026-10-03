@@ -3,7 +3,7 @@ use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const NATIVE_TRANSPORT: &str = "nvst";
@@ -11,6 +11,19 @@ const CONSOLE_POLICY_VERSION: &str = "qtConsoleModePolicyVersion";
 const WINDOWS_GPU_DEVICE_ID: &str = "windowsGpuDeviceId";
 const MAXIMUM_WINDOWS_GPU_DEVICE_ID_BYTES: usize = 1024;
 const MAXIMUM_BOOTSTRAP_SETTINGS_BYTES: u64 = 1024 * 1024;
+const MAXIMUM_SHORTCUT_BYTES: usize = 80;
+const SHORTCUT_KEYS: [&str; 9] = [
+    "shortcutToggleStats",
+    "shortcutTogglePointerLock",
+    "shortcutToggleFullscreen",
+    "shortcutStopStream",
+    "shortcutToggleAntiAfk",
+    "shortcutToggleMicrophone",
+    "shortcutScreenshot",
+    "shortcutToggleRecording",
+    "shortcutSaveClip",
+];
+const RESERVED_SHORTCUTS: [&str; 2] = ["Ctrl+G", "Shift+F3"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LoadPolicy {
@@ -48,8 +61,15 @@ impl SettingsStore {
         let mut values = defaults.clone();
         let mut passthrough = Map::new();
         let mut migrate_onboarding = false;
-        if path.exists() {
-            match read_persisted_settings(&path, policy) {
+        let mut recovered_backup = false;
+        let backup = path.with_extension("json.bak");
+        if path.exists() || backup.exists() {
+            let persisted = read_persisted_settings(&path, policy).or_else(|| {
+                let persisted = read_persisted_settings(&backup, policy);
+                recovered_backup = persisted.is_some();
+                persisted
+            });
+            match persisted {
                 Some(persisted) => {
                     migrate_onboarding = policy == LoadPolicy::ReadWrite
                         && !persisted.contains_key("onboardingCompleted");
@@ -80,7 +100,8 @@ impl SettingsStore {
                                 value
                             };
                             values.insert(key, value);
-                        } else if key != "nativeHdrSupported" {
+                        } else if !matches!(key.as_str(), "nativeHdrSupported" | "nativeHdrDisplay")
+                        {
                             if policy == LoadPolicy::ReadWrite
                                 && key == "sessionTimeRemainingDisplay"
                                 && matches!(value.as_str(), Some("stats" | "both"))
@@ -123,10 +144,19 @@ impl SettingsStore {
                 .passthrough
                 .insert(CONSOLE_POLICY_VERSION.to_owned(), json!(1));
         }
+        let codec_before_normalize = store.values["codec"].clone();
+        let fallback_before_normalize = store.values["fallbackCodec"].clone();
         store.normalize();
+        // Persist a first-launch codec/color heal: profiles saved before the
+        // settings page greyed out unsupported combinations are repaired toward
+        // Auto above; write the repaired values back so the fix sticks.
+        let codec_color_healed = policy == LoadPolicy::ReadWrite
+            && (store.values["codec"] != codec_before_normalize
+                || store.values["fallbackCodec"] != fallback_before_normalize);
         if policy == LoadPolicy::ReadWrite
-            && (migrate_console_policy || migrate_onboarding)
-            && store.path.exists()
+            && (recovered_backup
+                || ((migrate_console_policy || migrate_onboarding || codec_color_healed)
+                    && store.path.exists()))
         {
             store.save()?;
         }
@@ -138,8 +168,32 @@ impl SettingsStore {
     }
 
     pub fn set(&mut self, key: &str, mut value: Value) -> Result<Value, String> {
+        if matches!(key, "providerRegions" | "regionProviderIdpId") {
+            return Err("Provider region metadata is managed with the selected region".into());
+        }
         if !defaults().contains_key(key) {
             return Err(format!("Unknown setting: {key}"));
+        }
+        if matches!(key, "codec" | "fallbackCodec") {
+            // Reject only recognized explicit codecs that the saved color mode
+            // cannot use. Unknown spellings fall through to normalize_choice,
+            // which clamps them to Auto.
+            if let Some(codec) = value.as_str() {
+                let name = codec.trim().to_ascii_lowercase();
+                let known_explicit =
+                    matches!(name.as_str(), "h264" | "avc" | "h265" | "hevc" | "av1");
+                if known_explicit {
+                    let color = self.values["colorQuality"].as_str().unwrap_or("8bit_420");
+                    if !crate::streamer::codec_supports_color_quality(&name, color) {
+                        return Err(format!(
+                            "{codec} cannot request {color}. Select Auto or H.265 for advanced color."
+                        ));
+                    }
+                }
+            }
+        }
+        if matches!(key, "gameLanguage" | "keyboardLayout") {
+            crate::language::validate_setting(key, &value)?;
         }
         if key == "audioOutputDevice" {
             validate_bounded_string(&value, key, 1024)?;
@@ -208,6 +262,95 @@ impl SettingsStore {
             return Err(format!("Could not reset settings: {error}"));
         }
         Ok(self.all())
+    }
+
+    pub fn set_shortcuts(&mut self, bindings: &Value) -> Result<Map<String, Value>, String> {
+        let bindings = bindings
+            .as_object()
+            .filter(|bindings| !bindings.is_empty())
+            .ok_or_else(|| "Shortcut bindings must be a non-empty object".to_owned())?;
+        let mut applied = Map::new();
+        for (key, value) in bindings {
+            if !SHORTCUT_KEYS.contains(&key.as_str()) {
+                return Err(format!("Unknown shortcut setting: {key}"));
+            }
+            let chord = value
+                .as_str()
+                .ok_or_else(|| format!("{key} must be a string"))?
+                .trim();
+            if chord.len() > MAXIMUM_SHORTCUT_BYTES {
+                return Err(format!("{key} is too long"));
+            }
+            if RESERVED_SHORTCUTS
+                .iter()
+                .any(|reserved| canonical_shortcut(reserved) == canonical_shortcut(chord))
+            {
+                return Err(format!("{chord} is reserved"));
+            }
+            applied.insert(key.clone(), Value::String(chord.to_owned()));
+        }
+        let chord_of = |key: &str| {
+            applied
+                .get(key)
+                .or_else(|| self.values.get(key))
+                .and_then(Value::as_str)
+                .map(canonical_shortcut)
+                .unwrap_or_default()
+        };
+        for changed in applied.keys() {
+            let chord = chord_of(changed);
+            if chord.is_empty() {
+                continue;
+            }
+            if let Some(owner) = SHORTCUT_KEYS
+                .iter()
+                .find(|key| **key != changed.as_str() && chord_of(key) == chord)
+            {
+                return Err(format!(
+                    "{} is assigned to both {changed} and {owner}",
+                    applied[changed].as_str().unwrap_or_default()
+                ));
+            }
+        }
+        let previous_values = self.values.clone();
+        for (key, value) in &applied {
+            self.values.insert(key.clone(), value.clone());
+        }
+        self.normalize();
+        if let Err(error) = self.save() {
+            self.values = previous_values;
+            return Err(format!("Could not save settings: {error}"));
+        }
+        Ok(applied
+            .keys()
+            .map(|key| (key.clone(), self.values[key].clone()))
+            .collect())
+    }
+
+    pub fn set_provider_region(&mut self, provider: &str, value: Value) -> Result<Value, String> {
+        validate_bounded_string(&value, "region", 256)?;
+        if provider.is_empty() || provider.len() > 256 {
+            return Err("Invalid region provider".into());
+        }
+        let previous_values = self.values.clone();
+        let mut regions = self.values["providerRegions"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        if !regions.contains_key(provider) && regions.len() >= 32 {
+            return Err("Too many saved region providers".into());
+        }
+        regions.insert(provider.to_owned(), value.clone());
+        self.values
+            .insert("providerRegions".into(), Value::Object(regions));
+        self.values
+            .insert("regionProviderIdpId".into(), json!(provider));
+        self.values.insert("region".into(), value.clone());
+        if let Err(error) = self.save() {
+            self.values = previous_values;
+            return Err(format!("Could not save region: {error}"));
+        }
+        Ok(value)
     }
 
     fn normalize(&mut self) {
@@ -309,6 +452,22 @@ impl SettingsStore {
             &["8bit_420", "10bit_420", "8bit_444", "10bit_444"],
             "8bit_420",
         );
+        // Keep an explicitly saved codec compatible with the saved color mode,
+        // mirroring the official settings gating (H.264 is 8-bit 4:2:0 only, AV1
+        // is 4:2:0 only). Repairing toward Auto preserves the saved quality
+        // choice. This heals older profiles on load and re-heals after an
+        // explicit color change; settings.set rejects newly incompatible
+        // explicit codec selections outright.
+        let color = self.values["colorQuality"]
+            .as_str()
+            .unwrap_or("8bit_420")
+            .to_owned();
+        for key in ["codec", "fallbackCodec"] {
+            let codec = self.values[key].as_str().unwrap_or("auto");
+            if !crate::streamer::codec_supports_color_quality(codec, &color) {
+                self.values.insert(key.to_owned(), json!("auto"));
+            }
+        }
         normalize_choice(&mut self.values, "frameGeneration", &["off", "2x"], "off");
         normalize_choice(
             &mut self.values,
@@ -383,8 +542,8 @@ impl SettingsStore {
             100,
             100,
         );
-        clamp_integer(&mut self.values, "fps", 30, 240, 60);
-        clamp_integer(&mut self.values, "maxBitrateMbps", 1, 200, 75);
+        clamp_integer(&mut self.values, "fps", 30, 360, 60);
+        clamp_bitrate_mbps(&mut self.values);
         clamp_integer(&mut self.values, "windowWidth", 960, 7680, 1400);
         clamp_integer(&mut self.values, "windowHeight", 540, 4320, 900);
         clamp_integer(&mut self.values, "recordingFps", 30, 60, 30);
@@ -450,15 +609,18 @@ impl SettingsStore {
         let mut persisted = self.passthrough.clone();
         persisted.extend(self.values.clone());
         let data = serde_json::to_vec_pretty(&persisted).map_err(io::Error::other)?;
-        fs::write(&temporary, data)?;
-        if self.path.exists() {
-            let _ = fs::remove_file(&backup);
-            fs::rename(&self.path, &backup)?;
+        let mut file = fs::File::create(&temporary)?;
+        file.write_all(&data)?;
+        file.sync_all()?;
+        drop(file);
+        if read_persisted_settings(&self.path, LoadPolicy::ReadWrite).is_some() {
+            fs::copy(&self.path, &backup)?;
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&backup)?
+                .sync_all()?;
         }
-        if let Err(error) = fs::rename(&temporary, &self.path) {
-            let _ = fs::rename(&backup, &self.path);
-            return Err(error);
-        }
+        fs::rename(&temporary, &self.path)?;
         Ok(())
     }
 }
@@ -625,6 +787,25 @@ fn clamp_integer(
     values.insert(key.to_owned(), Value::Number(value.into()));
 }
 
+fn clamp_bitrate_mbps(values: &mut Map<String, Value>) {
+    // 0.22 Mbps is 220 kbps. Whole numbers stay integers so existing settings
+    // and the 10–200 Mbps slider keep their previous JSON shape.
+    let raw = values
+        .get("maxBitrateMbps")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .unwrap_or(75.0);
+    let value = (raw.clamp(0.22, 200.0) * 100.0).round() / 100.0;
+    let stored = if (value - value.round()).abs() < 1e-9 {
+        Value::from(value.round() as i64)
+    } else {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .unwrap_or_else(|| Value::from(75))
+    };
+    values.insert("maxBitrateMbps".to_owned(), stored);
+}
+
 fn clamp_number(
     values: &mut Map<String, Value>,
     key: &str,
@@ -680,9 +861,29 @@ fn normalize_optional_integer(
     );
 }
 
+fn canonical_shortcut(chord: &str) -> String {
+    let mut parts = chord
+        .split('+')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .map(|part| {
+            if part == "control" {
+                "ctrl".to_owned()
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>();
+    let key = parts.pop().unwrap_or_default();
+    parts.sort();
+    parts.dedup();
+    parts.push(key);
+    parts.join("+")
+}
+
 fn normalize_bounded_strings(values: &mut Map<String, Value>) {
     for (key, maximum) in [
         ("region", 256_usize),
+        ("regionProviderIdpId", 256_usize),
         ("sessionProxyUrl", 2_048),
         ("nativeStreamerExecutablePath", 2_048),
         ("microphoneDeviceId", 512),
@@ -698,17 +899,7 @@ fn normalize_bounded_strings(values: &mut Map<String, Value>) {
             .collect::<String>();
         values.insert(key.to_owned(), Value::String(value));
     }
-    for key in [
-        "shortcutToggleStats",
-        "shortcutTogglePointerLock",
-        "shortcutToggleFullscreen",
-        "shortcutStopStream",
-        "shortcutToggleAntiAfk",
-        "shortcutToggleMicrophone",
-        "shortcutScreenshot",
-        "shortcutToggleRecording",
-        "shortcutSaveClip",
-    ] {
+    for key in SHORTCUT_KEYS {
         let value = values
             .get(key)
             .and_then(Value::as_str)
@@ -859,7 +1050,7 @@ fn defaults() -> Map<String, Value> {
         "onboardingCompleted":false,
         "resolution":"1920x1080", "aspectRatio":"16:9", "posterSizeScale":1.05,
         "fps":60, "frameGeneration":"off", "upscaling":"off", "upscalingSharpness":10, "upscalingDenoise":0,
-        "maxBitrateMbps":75, "recordingBitrateMbps":null,
+        "maxBitrateMbps":75, "saveBandwidth":false, "recordingBitrateMbps":null,
         "recordingResolution":"720p", "recordingFps":30, "streamClientMode":"native",
         "replayBufferEnabled":false, "replayBufferSeconds":30, "replayBufferMemoryMiB":256,
         "nativeVideoBackend":"auto", "nativeStreamerExecutablePath":"", "audioOutputDevice":"",
@@ -867,9 +1058,9 @@ fn defaults() -> Map<String, Value> {
         "nativeCloudGsyncMode":"auto", "nativeD3dFullscreenMode":"auto",
         "nativeExternalRenderer":false, "transportMode":"nvst", "showNativeStreamerStats":false,
         "codec":"auto", "fallbackCodec":"auto", "decoderPreference":"auto",
-        "encoderPreference":"auto", "colorQuality":"8bit_420", "enableHdr":false, "region":"",
+        "encoderPreference":"auto", "colorQuality":"8bit_420", "enableHdr":false, "region":"", "regionProviderIdpId":"", "providerRegions":{},
         "suppressTenBitWarning":false,
-        "sessionProxyEnabled":false, "sessionProxyUrl":"", "clipboardPaste":false,
+        "sessionProxyEnabled":false, "sessionProxyUrl":"", "clipboardPaste":false, "networkTest":false,
         "enableGyroscopeControls":false, "steamControllerCompatibilityMode":false,
         "nativeCursorOverlay":true, "mouseSensitivity":1, "mouseAcceleration":1,
         "shortcutToggleStats":"Ctrl+N", "shortcutTogglePointerLock":"F8",
@@ -881,7 +1072,7 @@ fn defaults() -> Map<String, Value> {
         "muteWhenOutOfFocus":false, "backgroundStreamReminder":false,
         "showAntiAfkIndicator":true, "antiAfkReminderEveryMinutes":15,
         "antiAfkReminderDurationSeconds":5, "showStatsOnLaunch":false,
-        "statsOverlayPosition":"top-right", "hideServerSelector":false,
+        "statsOverlayPosition":"top-right", "hideServerSelector":false, "hideQueueSelector":false,
         "desktopUiScale":1.0, "statsOverlayScale":1.0, "statsOverlayOpacity":85,
         "themeAccentOverride":false,
         "statsShowFps":true, "statsShowRegion":true, "statsShowPing":true,
@@ -921,6 +1112,195 @@ fn defaults() -> Map<String, Value> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn settings_backup_recovers_missing_and_corrupt_primary_without_bootstrap_writes() {
+        for corrupt in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("settings.json");
+            let backup = path.with_extension("json.bak");
+            let temporary = path.with_extension("json.tmp");
+            let mut original = SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+            original
+                .set("windowsGpuDeviceId", json!("fixture-gpu"))
+                .unwrap();
+            original.set("windowWidth", json!(1600)).unwrap();
+            let expected = original.all();
+            let bytes = fs::read(&path).unwrap();
+            fs::rename(&path, &backup).unwrap();
+            fs::write(&temporary, b"interrupted write").unwrap();
+            if corrupt {
+                fs::write(&path, b"{").unwrap();
+            }
+            assert_eq!(
+                SettingsStore::windows_gpu_device_id_read_only(Some(directory.path().to_owned()))
+                    .unwrap(),
+                "fixture-gpu"
+            );
+            assert_eq!(fs::read(&backup).unwrap(), bytes);
+            assert_eq!(fs::read(&temporary).unwrap(), b"interrupted write");
+            assert!(!path.with_extension("json.corrupt").exists());
+            if corrupt {
+                assert_eq!(fs::read(&path).unwrap(), b"{");
+            } else {
+                assert!(!path.exists());
+            }
+            let restored = SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+            assert_eq!(restored.all(), expected);
+            assert_eq!(fs::read(&backup).unwrap(), bytes);
+            assert_eq!(
+                SettingsStore::load(Some(directory.path().to_owned()))
+                    .unwrap()
+                    .all(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn settings_recovery_failure_keeps_the_valid_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let backup = path.with_extension("json.bak");
+        let mut store = SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+        store.set("windowWidth", json!(1600)).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        fs::rename(&path, &backup).unwrap();
+        fs::create_dir(path.with_extension("json.tmp")).unwrap();
+        assert!(SettingsStore::load(Some(directory.path().to_owned())).is_err());
+        assert!(!path.exists());
+        assert_eq!(fs::read(&backup).unwrap(), bytes);
+    }
+
+    #[test]
+    fn settings_backup_failure_keeps_the_primary_and_memory_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut store = SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+        store.set("windowWidth", json!(1600)).unwrap();
+        let expected = store.all();
+        let bytes = fs::read(&path).unwrap();
+        fs::create_dir(path.with_extension("json.bak")).unwrap();
+        assert!(store.set("windowWidth", json!(1800)).is_err());
+        assert_eq!(store.all(), expected);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn settings_bootstrap_does_not_recover_invalid_or_oversized_backups() {
+        let directory = tempfile::tempdir().unwrap();
+        let backup = directory.path().join("settings.json.bak");
+        for bytes in [
+            b"{".to_vec(),
+            vec![b' '; MAXIMUM_BOOTSTRAP_SETTINGS_BYTES as usize + 1],
+        ] {
+            fs::write(&backup, &bytes).unwrap();
+            assert_eq!(
+                SettingsStore::windows_gpu_device_id_read_only(Some(directory.path().to_owned()))
+                    .unwrap(),
+                ""
+            );
+            assert_eq!(fs::read(&backup).unwrap(), bytes);
+            assert!(!directory.path().join("settings.json").exists());
+        }
+    }
+
+    #[test]
+    fn language_preferences_are_independent_and_rejected_writes_are_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore::load(Some(directory.path().to_path_buf())).unwrap();
+        for (key, value) in [
+            ("appLanguage", "ja"),
+            ("gameLanguage", "es_419"),
+            ("keyboardLayout", "ja-JP"),
+        ] {
+            store.set(key, json!(value)).unwrap();
+        }
+        let saved = store.all();
+        for (key, value) in [
+            ("gameLanguage", "auto"),
+            ("gameLanguage", "system"),
+            ("gameLanguage", "en\nUS"),
+            ("keyboardLayout", "en_US"),
+            ("keyboardLayout", "m-us"),
+        ] {
+            assert!(store.set(key, json!(value)).is_err());
+            assert_eq!(store.all(), saved);
+        }
+        assert_eq!(
+            SettingsStore::load(Some(directory.path().to_path_buf()))
+                .unwrap()
+                .all(),
+            saved
+        );
+        store.set("appLanguage", json!("de")).unwrap();
+        assert_eq!(store.all()["gameLanguage"], "es_419");
+        assert_eq!(store.all()["keyboardLayout"], "ja-JP");
+        store.set("gameLanguage", json!("future_001")).unwrap();
+        assert_eq!(store.all()["appLanguage"], "de");
+        assert_eq!(store.all()["keyboardLayout"], "ja-JP");
+        std::fs::create_dir(store.path.with_extension("json.tmp")).unwrap();
+        let saved = store.all();
+        assert!(store.set("gameLanguage", json!("pt_BR")).is_err());
+        assert_eq!(store.all(), saved);
+    }
+
+    #[test]
+    fn restored_language_ids_are_not_rewritten_but_corrupt_values_never_reach_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("settings.json"),
+            json!({
+                "gameLanguage":"auto", "keyboardLayout":"unknown", "appLanguage":"fr",
+                "onboardingCompleted":true, "qtConsoleModePolicyVersion":1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let settings = SettingsStore::load(Some(directory.path().to_path_buf()))
+            .unwrap()
+            .all();
+        assert_eq!(settings["gameLanguage"], "auto");
+        assert_eq!(settings["keyboardLayout"], "unknown");
+        let mut url = url::Url::parse("https://fixture.invalid/").unwrap();
+        crate::language::append_session_preferences(&mut url, &settings);
+        assert_eq!(url.query(), Some("keyboardLayout=en-US&languageCode=en_US"));
+    }
+
+    #[test]
+    fn provider_region_preferences_are_atomic_isolated_and_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore::load(Some(directory.path().to_path_buf())).unwrap();
+        store
+            .set_provider_region("nvidia", json!("https://nvidia-region.nvidiagrid.net/"))
+            .unwrap();
+        store
+            .set_provider_region("alliance", json!("https://alliance-region.nvidiagrid.net/"))
+            .unwrap();
+        let restored = SettingsStore::load(Some(directory.path().to_path_buf()))
+            .unwrap()
+            .all();
+        assert_eq!(
+            restored["providerRegions"]["nvidia"],
+            "https://nvidia-region.nvidiagrid.net/"
+        );
+        assert_eq!(restored["providerRegions"]["alliance"], restored["region"]);
+        assert_eq!(restored["regionProviderIdpId"], "alliance");
+        assert!(store.set("providerRegions", json!({})).is_err());
+        assert!(
+            store
+                .set_provider_region("alliance", json!("x".repeat(257)))
+                .is_err()
+        );
+        assert_eq!(store.all(), restored);
+        std::fs::create_dir(store.path.with_extension("json.tmp")).unwrap();
+        assert!(
+            store
+                .set_provider_region("nvidia", json!("changed"))
+                .is_err()
+        );
+        assert_eq!(store.all(), restored);
+    }
 
     #[test]
     fn updater_preferences_are_independent_and_preserved() {
@@ -1093,6 +1473,21 @@ mod tests {
     }
 
     #[test]
+    fn queue_selector_preference_is_typed_persisted_and_resettable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+        assert_eq!(store.all()["hideQueueSelector"], false);
+        store.set("hideQueueSelector", json!(true)).unwrap();
+        let mut store = SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+        assert_eq!(store.all()["hideQueueSelector"], true);
+        for invalid in [json!("true"), json!(1), json!(null), json!([])] {
+            assert_eq!(store.set("hideQueueSelector", invalid).unwrap(), false);
+        }
+        store.set("hideQueueSelector", json!(true)).unwrap();
+        assert_eq!(store.reset().unwrap()["hideQueueSelector"], false);
+    }
+
+    #[test]
     fn background_stream_preferences_are_opt_in_and_persisted() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1203,6 +1598,55 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_transaction_moves_chords_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+        let applied = store
+            .set_shortcuts(&json!({"shortcutToggleStats":"Ctrl+F11","shortcutScreenshot":""}))
+            .unwrap();
+        assert_eq!(applied["shortcutToggleStats"], json!("Ctrl+F11"));
+        assert_eq!(applied["shortcutScreenshot"], json!(""));
+        let reloaded = SettingsStore::load(Some(directory.path().to_owned())).unwrap();
+        assert_eq!(reloaded.all()["shortcutToggleStats"], json!("Ctrl+F11"));
+        assert_eq!(reloaded.all()["shortcutScreenshot"], json!(""));
+
+        let before = store.all();
+        for rejected in [
+            json!({"shortcutToggleFullscreen":"ctrl + f11"}),
+            json!({"shortcutToggleFullscreen":"Ctrl+G"}),
+            json!({"shortcutSaveClip":"Shift+F3"}),
+            json!({"shortcutToggleStats":"F1","appTheme":"light"}),
+            json!({"shortcutToggleStats":7}),
+            json!({"shortcutToggleStats":"x".repeat(81)}),
+            json!({}),
+            json!([]),
+        ] {
+            assert!(store.set_shortcuts(&rejected).is_err(), "{rejected}");
+            assert_eq!(store.all(), before, "{rejected} must not partially apply");
+        }
+
+        store.set("shortcutToggleRecording", json!("F8")).unwrap();
+        store
+            .set_shortcuts(&json!({"shortcutSaveClip":"Alt+F12"}))
+            .expect("an existing duplicate must not block unrelated shortcut edits");
+        assert!(
+            store
+                .set_shortcuts(&json!({"shortcutToggleRecording":"F8"}))
+                .is_err()
+        );
+
+        let defaults = defaults();
+        let reset = SHORTCUT_KEYS
+            .iter()
+            .map(|key| (key.to_string(), defaults[*key].clone()))
+            .collect::<Map<_, _>>();
+        store.set_shortcuts(&Value::Object(reset)).unwrap();
+        for key in SHORTCUT_KEYS {
+            assert_eq!(store.all()[key], defaults[key]);
+        }
+    }
+
+    #[test]
     fn replay_is_opt_in_bounded_and_persisted() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1219,11 +1663,13 @@ mod tests {
         store.set("replayBufferSeconds", json!(999)).unwrap();
         store.set("replayBufferMemoryMiB", json!(1)).unwrap();
         store.set("shortcutSaveClip", json!("Alt+F12")).unwrap();
+        store.set("shortcutToggleRecording", json!("")).unwrap();
         let mut reloaded = SettingsStore::load(Some(directory.clone())).unwrap();
         assert_eq!(reloaded.all()["replayBufferEnabled"], json!(true));
         assert_eq!(reloaded.all()["replayBufferSeconds"], json!(120));
         assert_eq!(reloaded.all()["replayBufferMemoryMiB"], json!(64));
         assert_eq!(reloaded.all()["shortcutSaveClip"], json!("Alt+F12"));
+        assert_eq!(reloaded.all()["shortcutToggleRecording"], json!(""));
         reloaded.set("replayBufferSeconds", json!(-1)).unwrap();
         reloaded.set("replayBufferMemoryMiB", json!(9999)).unwrap();
         assert_eq!(reloaded.all()["replayBufferSeconds"], json!(15));
@@ -1724,6 +2170,17 @@ mod tests {
         let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
         assert_eq!(store.all()["enableHdr"], false);
         assert!(store.set("nativeHdrSupported", json!(true)).is_err());
+        assert!(
+            store
+                .set(
+                    "nativeHdrDisplay",
+                    json!({"minimumNits":0.005,"maximumNits":620,
+                        "maximumFullFrameNits":400,"redX":0.64,"redY":0.33,
+                        "greenX":0.30,"greenY":0.60,"blueX":0.15,"blueY":0.06,
+                        "whiteX":0.3127,"whiteY":0.329})
+                )
+                .is_err()
+        );
         assert_eq!(store.set("enableHdr", json!(true)).unwrap(), true);
         assert_eq!(
             SettingsStore::load(Some(directory.clone())).unwrap().all()["enableHdr"],
@@ -1732,12 +2189,18 @@ mod tests {
         let path = directory.join("settings.json");
         let mut persisted: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         persisted["nativeHdrSupported"] = json!(true);
+        persisted["nativeHdrDisplay"] = json!({"minimumNits":0.005,"maximumNits":620,
+            "maximumFullFrameNits":400,"redX":0.64,"redY":0.33,
+            "greenX":0.30,"greenY":0.60,"blueX":0.15,"blueY":0.06,
+            "whiteX":0.3127,"whiteY":0.329});
         fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
         let mut loaded = SettingsStore::load(Some(directory.clone())).unwrap();
         assert!(loaded.all().get("nativeHdrSupported").is_none());
+        assert!(loaded.all().get("nativeHdrDisplay").is_none());
         loaded.set("enableHdr", json!(true)).unwrap();
         let persisted: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert!(persisted.get("nativeHdrSupported").is_none());
+        assert!(persisted.get("nativeHdrDisplay").is_none());
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2021,7 +2484,15 @@ mod tests {
         assert_eq!(preferences.all()["statsShowFps"], json!(false));
         assert_eq!(preferences.all()["statsShowRegion"], json!(false));
         assert_eq!(preferences.all()["statsOverlayScale"], json!(1.5));
-        assert_eq!(store.set("fps", json!(999)).unwrap(), json!(240));
+        assert_eq!(store.set("fps", json!(999)).unwrap(), json!(360));
+        assert_eq!(store.set("fps", json!(360)).unwrap(), json!(360));
+        assert_eq!(store.set("fps", json!(240)).unwrap(), json!(240));
+        assert_eq!(store.set("maxBitrateMbps", json!(200)).unwrap(), json!(200));
+        let low_bitrate = store.set("maxBitrateMbps", json!(0.22)).unwrap();
+        assert!((low_bitrate.as_f64().unwrap() - 0.22).abs() < 0.001);
+        let clamped_bitrate = store.set("maxBitrateMbps", json!(0.1)).unwrap();
+        assert!((clamped_bitrate.as_f64().unwrap() - 0.22).abs() < 0.001);
+        assert_eq!(store.set("maxBitrateMbps", json!(27)).unwrap(), json!(27));
         assert_eq!(store.set("maxBitrateMbps", json!(200)).unwrap(), json!(200));
         assert_eq!(
             store.set("launchInConsoleMode", json!(false)).unwrap(),
@@ -2031,9 +2502,22 @@ mod tests {
             store.set("reducedMotion", json!(true)).unwrap(),
             json!(true)
         );
+        assert_eq!(
+            store.set("saveBandwidth", json!(true)).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            store.set("saveBandwidth", json!("yes")).unwrap(),
+            json!(false)
+        );
+        assert_eq!(
+            store.set("saveBandwidth", json!(true)).unwrap(),
+            json!(true)
+        );
         let loaded = SettingsStore::load(Some(directory.clone())).unwrap();
         assert_eq!(loaded.all()["fps"], json!(240));
         assert_eq!(loaded.all()["maxBitrateMbps"], json!(200));
+        assert_eq!(loaded.all()["saveBandwidth"], json!(true));
         assert_eq!(loaded.all()["launchInConsoleMode"], json!(false));
         assert_eq!(loaded.all()["reducedMotion"], json!(true));
         assert!(store.set("notASetting", json!(true)).is_err());
@@ -2380,6 +2864,97 @@ mod tests {
                 json!(12)
             );
         }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn incompatible_saved_codec_color_combo_heals_to_auto_on_first_launch() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-codec-color-heal-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("settings.json"),
+            r#"{"codec":"av1","fallbackCodec":"h264","colorQuality":"10bit_444"}"#,
+        )
+        .unwrap();
+
+        let store = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(store.all()["colorQuality"], json!("10bit_444"));
+        assert_eq!(store.all()["codec"], json!("auto"));
+        assert_eq!(store.all()["fallbackCodec"], json!("auto"));
+
+        // The repair persists so the next launch starts from a valid profile.
+        let reloaded = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(reloaded.all()["codec"], json!("auto"));
+        assert_eq!(reloaded.all()["fallbackCodec"], json!("auto"));
+        assert_eq!(reloaded.all()["colorQuality"], json!("10bit_444"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn compatible_saved_codec_color_combo_survives_reload_unchanged() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-codec-color-keep-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("settings.json"),
+            r#"{"codec":"h265","fallbackCodec":"auto","colorQuality":"10bit_444"}"#,
+        )
+        .unwrap();
+
+        let store = SettingsStore::load(Some(directory.clone())).unwrap();
+        assert_eq!(store.all()["codec"], json!("h265"));
+        assert_eq!(store.all()["fallbackCodec"], json!("auto"));
+        assert_eq!(store.all()["colorQuality"], json!("10bit_444"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn color_change_heals_an_incompatible_explicit_codec() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-color-change-heal-{unique}"));
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        store.set("codec", json!("av1")).unwrap();
+        store.set("colorQuality", json!("10bit_444")).unwrap();
+        assert_eq!(store.all()["colorQuality"], json!("10bit_444"));
+        assert_eq!(store.all()["codec"], json!("auto"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicit_codec_selection_rejects_color_incompatible_values() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = env::temp_dir().join(format!("opennow-codec-reject-{unique}"));
+        let mut store = SettingsStore::load(Some(directory.clone())).unwrap();
+        store.set("colorQuality", json!("10bit_444")).unwrap();
+        for codec in ["av1", "h264"] {
+            let error = store.set("codec", json!(codec)).unwrap_err();
+            assert!(error.contains(codec), "{error}");
+            assert_eq!(store.all()["codec"], json!("auto"));
+        }
+        for codec in ["auto", "h265"] {
+            store.set("codec", json!(codec)).unwrap();
+            assert_eq!(store.all()["codec"], json!(codec));
+        }
+        let error = store.set("fallbackCodec", json!("h264")).unwrap_err();
+        assert!(error.contains("h264"), "{error}");
+        store.set("colorQuality", json!("8bit_420")).unwrap();
+        store.set("codec", json!("h264")).unwrap();
+        store.set("fallbackCodec", json!("h264")).unwrap();
+        assert_eq!(store.all()["codec"], json!("h264"));
+        assert_eq!(store.all()["fallbackCodec"], json!("h264"));
         fs::remove_dir_all(directory).unwrap();
     }
 }

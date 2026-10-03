@@ -15,10 +15,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-const RELEASES_URL: &str =
-    "https://api.github.com/repos/OpenCloudGaming/OpenNOW/releases?per_page=20";
+const RELEASES_URL: &str = "https://api.github.com/repos/OpenCloudGaming/OpenNOW/releases";
 const RELEASES_PAGE: &str = "https://github.com/OpenCloudGaming/OpenNOW/releases";
 const RELEASE_ASSET_PREFIX: &str = "https://github.com/OpenCloudGaming/OpenNOW/releases/download/";
+const MAXIMUM_RELEASE_METADATA_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AvailableUpdate {
@@ -85,23 +85,40 @@ impl UpdaterService {
         let staging_dir = data_dir.join("updates");
         fs::create_dir_all(&staging_dir)
             .map_err(|error| format!("Could not create the update staging directory: {error}"))?;
-        let (transaction, status, message) =
-            if let Some(message) = update_apply::external_update_message() {
-                (None, "unsupported", message.to_owned())
-            } else {
-                match read_prepared_update(&staging_dir) {
+        let (transaction, status, message) = if let Some(message) =
+            update_apply::external_update_message()
+        {
+            (None, "unsupported", message.to_owned())
+        } else {
+            match update_apply::windows_installer_replacement_message() {
+                Ok(Some(message)) => (None, "not-available", message.to_owned()),
+                Err(error) => (
+                    None,
+                    "failed",
+                    format!(
+                        "Could not determine whether Windows Installer owns this installation: {error}"
+                    ),
+                ),
+                Ok(None) => match read_prepared_update(&staging_dir) {
                     Ok(transaction) => (
                         transaction,
                         "idle",
                         "Ready to check GitHub Releases".to_owned(),
                     ),
-                    Err(error) => (
-                        None,
-                        "failed",
-                        format!("Could not recover update status: {error}"),
-                    ),
-                }
-            };
+                    Err(error) => {
+                        // A corrupt transaction must not block every future launch. Report it
+                        // once for this session, then drop the unreadable persistence so the
+                        // next startup begins clean. Diagnostics remain in the message.
+                        let _ = fs::remove_file(staging_dir.join("active-apply.json"));
+                        (
+                            None,
+                            "failed",
+                            format!("Could not recover update status: {error}"),
+                        )
+                    }
+                },
+            }
+        };
         Ok(Self {
             client,
             staging_dir,
@@ -142,6 +159,13 @@ impl UpdaterService {
     }
 
     pub fn request_failed(&self, message: &str) {
+        if update_apply::windows_installer_replacement_message()
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
         let mut state = self.state.lock().expect("updater state poisoned");
         if !matches!(
             state.status,
@@ -162,6 +186,16 @@ impl UpdaterService {
         if update_apply::external_update_message().is_some() {
             return Ok(self.state());
         }
+        if let Some(message) = update_apply::windows_installer_replacement_message()? {
+            let mut state = self.state.lock().expect("updater state poisoned");
+            state.status = "not-available";
+            state.available = None;
+            state.available_version = None;
+            state.downloaded = None;
+            state.transaction = None;
+            state.message = message.to_owned();
+            return Ok(state_json(&state));
+        }
         let _operation = self.begin_operation()?;
         let channel = params["channel"]
             .as_str()
@@ -175,24 +209,8 @@ impl UpdaterService {
             state.transaction = None;
             state.message = "Checking GitHub Releases…".to_owned();
         }
-        let releases = self
-            .client
-            .get(RELEASES_URL)
-            .header(USER_AGENT, "OpenNOW-Qt/0.5")
-            .header(ACCEPT, "application/vnd.github+json")
-            .send()
-            .map_err(|error| friendly_network_error(&error.to_string()))
-            .and_then(|response| {
-                if !response.status().is_success() {
-                    return Err(format!(
-                        "GitHub Releases returned HTTP {}",
-                        response.status().as_u16()
-                    ));
-                }
-                response
-                    .json::<Vec<Release>>()
-                    .map_err(|_| "GitHub Releases returned invalid metadata".to_owned())
-            });
+        let _ = fs::remove_file(self.staging_dir.join("active-apply.json"));
+        let releases = self.fetch_releases(RELEASES_URL);
         let releases = match releases {
             Ok(releases) => releases,
             Err(error) => {
@@ -204,7 +222,8 @@ impl UpdaterService {
         };
         let current = parse_version(crate::version::APPLICATION_VERSION)
             .ok_or_else(|| "Current application version is invalid".to_owned())?;
-        let release = select_release(&releases, channel, current);
+        let release = select_installable_release(&releases, channel, &current)
+            .or_else(|| select_release(&releases, channel, current));
         let mut state = self.state.lock().expect("updater state poisoned");
         state.last_checked_at = Some(now_ms());
         // Reading release notes is independent of installing a newer version.
@@ -213,14 +232,10 @@ impl UpdaterService {
         if let Some(release) = release {
             let version = release.tag_name.trim_start_matches('v').to_owned();
             let compatible = compatible_asset(&release.assets).cloned();
-            let manifest_url = compatible.as_ref().and_then(|asset| {
-                let expected = format!("{}.manifest.json", asset.name);
-                release
-                    .assets
-                    .iter()
-                    .find(|candidate| candidate.name == expected && trusted_asset_url(candidate))
-                    .map(|candidate| candidate.browser_download_url.clone())
-            });
+            let manifest_url = compatible
+                .as_ref()
+                .and_then(|asset| manifest_asset(release, asset))
+                .map(|manifest| manifest.browser_download_url.clone());
             state.status = "available";
             state.available_version = Some(version.clone());
             state.release_url = trusted_release_url(&release.html_url)
@@ -240,19 +255,70 @@ impl UpdaterService {
                 )
             } else if embedded_update_key().is_err() {
                 format!(
-                    "OpenNOW {version} is available; this validation build has no pinned update signing key."
+                    "OpenNOW {version} is available; this build has no pinned update signing key. Install a signed-update build manually once to enable future automatic updates."
                 )
             } else {
                 format!("OpenNOW {version} is available with signed update metadata.")
             };
         } else {
-            state.status = "not-available";
+            let has_release = select_latest_release(&releases, channel).is_some();
+            state.status = if has_release {
+                "not-available"
+            } else {
+                "error"
+            };
             state.available_version = None;
             state.available = None;
-            state.message = "OpenNOW is up to date.".to_owned();
+            state.message = if has_release {
+                "OpenNOW is up to date.".to_owned()
+            } else {
+                format!(
+                    "No published releases were found for the {channel} update channel. Try again later."
+                )
+            };
         }
         restore_downloaded_status(&mut state);
         Ok(state_json(&state))
+    }
+
+    fn fetch_releases(&self, releases_url: &str) -> Result<Vec<Release>, String> {
+        let mut releases = Vec::new();
+        for (url, latest) in [
+            (format!("{releases_url}?per_page=100"), false),
+            (format!("{releases_url}/latest"), true),
+        ] {
+            let response = self
+                .client
+                .get(url)
+                .timeout(Duration::from_secs(10))
+                .header(
+                    USER_AGENT,
+                    concat!("OpenNOW-Qt/", env!("CARGO_PKG_VERSION")),
+                )
+                .header(ACCEPT, "application/vnd.github+json")
+                .send()
+                .map_err(|error| friendly_network_error(&error.to_string()))?;
+            if latest && response.status() == reqwest::StatusCode::NOT_FOUND {
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(format!(
+                    "GitHub Releases returned HTTP {}",
+                    response.status().as_u16()
+                ));
+            }
+            let bytes = read_bounded(response, MAXIMUM_RELEASE_METADATA_BYTES)?;
+            if latest {
+                let release: Release = serde_json::from_slice(&bytes)
+                    .map_err(|_| "GitHub Releases returned invalid metadata".to_owned())?;
+                releases.retain(|existing: &Release| existing.tag_name != release.tag_name);
+                releases.push(release);
+            } else {
+                releases = serde_json::from_slice(&bytes)
+                    .map_err(|_| "GitHub Releases returned invalid metadata".to_owned())?;
+            }
+        }
+        Ok(releases)
     }
 
     pub fn download(&self) -> Result<Value, String> {
@@ -269,6 +335,7 @@ impl UpdaterService {
             state.message = format!("Downloading OpenNOW {}…", available.version);
             available
         };
+        let _ = fs::remove_file(self.staging_dir.join("active-apply.json"));
         match self.download_verified(&available) {
             Ok(downloaded) => {
                 let mut state = self.state.lock().expect("updater state poisoned");
@@ -308,6 +375,7 @@ impl UpdaterService {
                 "Verifying and preparing a complete replacement before shutdown.".to_owned();
             state.transaction = None;
         }
+        let _ = fs::remove_file(self.staging_dir.join("active-apply.json"));
         let result = (|| {
             verify_downloaded_file(&downloaded)?;
             let application = std::env::var_os("OPENNOW_APP_EXECUTABLE")
@@ -340,6 +408,7 @@ impl UpdaterService {
             state.status = "failed";
             state.message = format!("Update preparation failed; OpenNOW remains open: {error}");
             state.transaction = None;
+            let _ = fs::remove_file(self.staging_dir.join("active-apply.json"));
             return Err(error);
         }
         Ok(self.state())
@@ -357,6 +426,9 @@ impl UpdaterService {
 
     fn begin_operation(&self) -> Result<std::sync::MutexGuard<'_, ()>, String> {
         if let Some(message) = update_apply::external_update_message() {
+            return Err(message.to_owned());
+        }
+        if let Some(message) = update_apply::windows_installer_replacement_message()? {
             return Err(message.to_owned());
         }
         let operation = self
@@ -533,11 +605,15 @@ fn reconcile_transaction(state: &mut State, staging_dir: &Path) {
             state.message =
                 "The update helper outcome is missing or does not match the prepared version."
                     .to_owned();
+            // Terminal: report once for this launch, then drop persistence so the next
+            // startup does not re-show the same failure dialog.
+            clear_finished_transaction(state, staging_dir);
             return;
         }
         Err(error) => {
             state.status = "failed";
             state.message = error;
+            clear_finished_transaction(state, staging_dir);
             return;
         }
     };
@@ -574,14 +650,7 @@ fn reconcile_transaction(state: &mut State, staging_dir: &Path) {
                 state.message = format!("Could not recover native update completion: {error}");
             }
         }
-        state.transaction = None;
-        match fs::remove_file(staging_dir.join("active-apply.json")) {
-            Ok(()) => (),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => state.message.push_str(&format!(
-                "; could not remove the completed update transaction: {error}"
-            )),
-        }
+        clear_finished_transaction(state, staging_dir);
         return;
     }
     if matches!(
@@ -597,11 +666,13 @@ fn reconcile_transaction(state: &mut State, staging_dir: &Path) {
             Ok(false) => {
                 state.status = "failed";
                 state.message = "The update helper stopped before completing the transaction. OpenNOW will not close automatically.".to_owned();
+                clear_finished_transaction(state, staging_dir);
                 return;
             }
             Err(error) => {
                 state.status = "failed";
                 state.message = format!("Could not confirm update helper ownership: {error}");
+                clear_finished_transaction(state, staging_dir);
                 return;
             }
         }
@@ -618,6 +689,26 @@ fn reconcile_transaction(state: &mut State, staging_dir: &Path) {
         OutcomeStatus::RebootRequired => "reboot-required",
     };
     state.message = outcome.message;
+    if matches!(
+        outcome.status,
+        OutcomeStatus::Completed | OutcomeStatus::RolledBack | OutcomeStatus::Failed
+    ) {
+        // Terminal helper outcomes are reported for this launch only. Clearing the
+        // persisted transaction prevents the same failure dialog on every restart,
+        // matching the managed-recovery behavior documented in core-protocol.md.
+        clear_finished_transaction(state, staging_dir);
+    }
+}
+
+fn clear_finished_transaction(state: &mut State, staging_dir: &Path) {
+    state.transaction = None;
+    match fs::remove_file(staging_dir.join("active-apply.json")) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => state.message.push_str(&format!(
+            "; could not remove the completed update transaction: {error}"
+        )),
+    }
 }
 
 fn restore_downloaded_status(state: &mut State) {
@@ -649,6 +740,39 @@ fn select_latest_release<'a>(releases: &'a [Release], channel: &str) -> Option<&
         .filter(|(_, version)| channel == "nightly" || version.pre.is_empty())
         .max_by(|(_, left), (_, right)| left.cmp_precedence(right))
         .map(|(release, _)| release)
+}
+
+fn select_installable_release<'a>(
+    releases: &'a [Release],
+    channel: &str,
+    current: &Version,
+) -> Option<&'a Release> {
+    releases
+        .iter()
+        .filter(|release| !release.draft && (channel == "nightly" || !release.prerelease))
+        .filter_map(|release| parse_version(&release.tag_name).map(|version| (release, version)))
+        .filter(|(_, version)| {
+            (channel == "nightly" || version.pre.is_empty())
+                && version.cmp_precedence(current).is_gt()
+        })
+        .filter(|(release, _)| {
+            compatible_asset(&release.assets)
+                .and_then(|asset| manifest_asset(release, asset))
+                .is_some()
+        })
+        .max_by(|(_, left), (_, right)| left.cmp_precedence(right))
+        .map(|(release, _)| release)
+}
+
+fn manifest_asset<'a>(release: &'a Release, asset: &Asset) -> Option<&'a Asset> {
+    let expected_name = format!("{}.manifest.json", asset.name);
+    let expected_url = format!("{}.manifest.json", asset.browser_download_url);
+    release.assets.iter().find(|manifest| {
+        manifest.name == expected_name
+            && manifest.browser_download_url == expected_url
+            && manifest.size > 0
+            && manifest.size <= MAXIMUM_MANIFEST_BYTES
+    })
 }
 
 fn update_highlights(state: &mut State, release: Option<&Release>) {
@@ -1147,6 +1271,9 @@ mod tests {
             update_apply::OutcomeStatus::Installing,
             update_apply::OutcomeStatus::AwaitingStartup,
         ] {
+            // Terminal failures clear persistence after the first report, so each
+            // stale-helper case needs fresh persistence to exercise the same path.
+            save_prepared_update(&updates, &prepared).unwrap();
             fs::write(
                 &prepared.outcome_path,
                 serde_json::to_vec(&update_apply::UpdateOutcome {
@@ -1164,6 +1291,49 @@ mod tests {
             assert_eq!(updater.state()["status"], "failed");
             assert_eq!(updater.state()["exitRequired"], false);
             assert!(!updater.installation_pending());
+            // The failure is reported for this launch only; the next startup begins
+            // clean instead of re-showing the same dialog.
+            assert!(!updates.join("active-apply.json").exists());
+        }
+    }
+
+    #[test]
+    fn terminal_helper_outcomes_are_reported_once_then_cleared() {
+        for (outcome, expected) in [
+            (update_apply::OutcomeStatus::Failed, "failed"),
+            (update_apply::OutcomeStatus::RolledBack, "rolled-back"),
+            (update_apply::OutcomeStatus::Completed, "succeeded"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let updates = directory.path().join("updates");
+            fs::create_dir(&updates).unwrap();
+            let prepared = update_apply::PreparedUpdate {
+                plan_path: directory.path().join("plan.json"),
+                outcome_path: directory.path().join("outcome.json"),
+                version: "1.1.0".to_owned(),
+            };
+            save_prepared_update(&updates, &prepared).unwrap();
+            fs::write(
+                &prepared.outcome_path,
+                serde_json::to_vec(&update_apply::UpdateOutcome {
+                    schema_version: 1,
+                    version: prepared.version.clone(),
+                    status: outcome,
+                    message: "Terminal helper result".to_owned(),
+                    installed_version: None,
+                    restarted_process: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let updater = UpdaterService::new(directory.path()).unwrap();
+            assert_eq!(updater.state()["status"], expected);
+            assert!(!updater.installation_pending());
+            assert!(!updates.join("active-apply.json").exists());
+            let restarted = UpdaterService::new(directory.path()).unwrap();
+            assert_eq!(restarted.state()["status"], "idle");
+            assert_eq!(restarted.state()["canCheck"], true);
+            assert!(!restarted.installation_pending());
         }
     }
 
@@ -1180,6 +1350,11 @@ mod tests {
         assert_eq!(updater.state()["status"], "failed");
         assert_eq!(updater.state()["exitRequired"], false);
         assert_eq!(updater.state()["canCheck"], true);
+        // Corrupt persistence is dropped after the first report so the next launch
+        // starts clean instead of failing forever.
+        assert!(!directory.path().join("updates/active-apply.json").exists());
+        let restarted = UpdaterService::new(directory.path()).unwrap();
+        assert_eq!(restarted.state()["status"], "idle");
     }
 
     #[test]
@@ -1266,6 +1441,140 @@ mod tests {
             prerelease,
             assets: vec![],
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_update(version: &str, prerelease: bool) -> Release {
+        let mut release = release(version, prerelease);
+        let architecture = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "x64"
+        };
+        let extension = update_apply::compatible_package_extension().unwrap();
+        let name = format!(
+            "OpenNOW-Qt-{}-Linux-{architecture}.{extension}",
+            version.trim_start_matches('v')
+        );
+        release.assets = [name.clone(), format!("{name}.manifest.json")]
+            .into_iter()
+            .map(|name| Asset {
+                browser_download_url: format!("{RELEASE_ASSET_PREFIX}{version}/{name}"),
+                name,
+                size: 128,
+            })
+            .collect();
+        release
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn incomplete_releases_do_not_hide_a_compatible_signed_update() {
+        let mut releases = vec![linux_update("v1.1.0", false), linux_update("v1.2.0", false)];
+        releases[1].assets.pop();
+        assert_eq!(
+            select_installable_release(&releases, "stable", &Version::new(1, 0, 0))
+                .unwrap()
+                .tag_name,
+            "v1.1.0"
+        );
+        assert!(select_installable_release(&releases, "stable", &Version::new(1, 1, 0)).is_none());
+        releases.push(linux_update("v1.3.0-nightly.1.1", true));
+        assert_eq!(
+            select_installable_release(&releases, "nightly", &Version::new(1, 0, 0))
+                .unwrap()
+                .tag_name,
+            "v1.3.0-nightly.1.1"
+        );
+        assert_eq!(
+            select_installable_release(&releases, "stable", &Version::new(1, 0, 0))
+                .unwrap()
+                .tag_name,
+            "v1.1.0"
+        );
+        releases[2].draft = true;
+        assert_eq!(
+            select_installable_release(&releases, "nightly", &Version::new(1, 0, 0))
+                .unwrap()
+                .tag_name,
+            "v1.1.0"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn manifests_must_belong_to_the_selected_release_and_be_bounded() {
+        let mut release = linux_update("v1.1.0", false);
+        assert!(manifest_asset(&release, &release.assets[0]).is_some());
+        for size in [0, MAXIMUM_MANIFEST_BYTES + 1] {
+            release.assets[1].size = size;
+            assert!(manifest_asset(&release, &release.assets[0]).is_none());
+        }
+        release.assets[1].size = 128;
+        release.assets[1].browser_download_url = release.assets[1]
+            .browser_download_url
+            .replace("/v1.1.0/", "/v1.0.0/");
+        assert!(manifest_asset(&release, &release.assets[0]).is_none());
+    }
+
+    #[test]
+    fn release_discovery_reaches_stable_beyond_the_nightly_window() {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/releases", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for path in ["/releases?per_page=100", "/releases/latest"] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with(&format!("GET {path} ")), "{line}");
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let metadata = |version: &str, prerelease| {
+                    json!({
+                        "tag_name":version,"html_url":format!("{RELEASES_PAGE}/tag/{version}"),
+                        "body":null,"draft":false,"prerelease":prerelease,"assets":[]
+                    })
+                };
+                let body = if path.ends_with("/latest") {
+                    metadata("v1.1.0", false).to_string()
+                } else {
+                    serde_json::to_string(
+                        &(1..=100)
+                            .map(|run| metadata(&format!("v1.2.0-nightly.{run}.1"), true))
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap()
+                };
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let updater = UpdaterService::new(directory.path()).unwrap();
+        let releases = updater.fetch_releases(&url).unwrap();
+        server.join().unwrap();
+        assert_eq!(releases.len(), 101);
+        assert_eq!(
+            select_release(&releases, "stable", Version::new(1, 0, 0))
+                .unwrap()
+                .tag_name,
+            "v1.1.0"
+        );
+        assert_eq!(
+            select_release(&releases, "nightly", Version::new(1, 0, 0))
+                .unwrap()
+                .tag_name,
+            "v1.2.0-nightly.100.1"
+        );
     }
 
     #[test]

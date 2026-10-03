@@ -69,6 +69,13 @@ Replace `conflict` with `unavailable` to check the session-limit retry screen, o
 `--desktop` with `--console`. These fixtures use synthetic sessions and do not connect
 to NVIDIA or prove live resume behavior.
 
+Use `finished` or `not-found` to inject an authoritative terminal response after a
+native error and an exhausted recovery episode. Both fixtures must clear the active
+seat, return to game detail, and leave no claim pending. The recovery protocol tests
+separately verify that authentication errors and transport EOF do not count as a
+normal session end. Capture terminal cases at 960×640 and 1600×900 with the same
+`--smoke-width`, `--smoke-height`, and `--screenshot` options.
+
 With an authorized account, disconnect from a game without ending its cloud session,
 restart OpenNOW, and select Play for the same game. Check that OpenNOW reconnects
 without asking to create another session. Select a different game and verify that
@@ -76,6 +83,66 @@ Cancel preserves the running game, Return to game reconnects to it, and End game
 start new closes it only after you choose that action. Repeat with the session in a
 different region and while the network is unavailable. A failed lookup must offer a
 retry rather than create another session. Verify windowed and fullscreen presentation.
+
+Run `ctest --test-dir build/opennow-qt --output-on-failure -R 'stream-recovery|language-settings|coreclient'`
+for authentication changes during claim/preparation, stale recovery responses, rapid
+settings edits, and settings event/response ordering. With a real account, repeat
+reauthentication during a reconnect: recovery must either continue under the seat's
+original account or wait for that account, without resuming a different account's seat.
+
+With a PIN-protected saved account, restart the application and verify that the account
+picker appears without activating that account. Enter its PIN to unlock it. During a
+stream, restart only the core process and open **Saved accounts** from sign-in. Verify
+that Accounts and PIN entry retain the same native video item, and that a successful
+unlock returns to the stream. Repeat in windowed and fullscreen modes. An explicit
+add-account flow must stay on sign-in rather than reopen the saved-account picker.
+
+Run `cargo test --manifest-path native/opennow-streamer/Cargo.toml -p opennow-streamer-core decode_recovery_has_a_terminal_deadline_unless_output_resumes`
+to inject permanently silent decoder feedback into the real engine loop. The failed
+case must emit one terminal error and stopped status after its recovery grace; resumed
+output must keep the session connected. This fixture does not validate a physical
+driver hung inside a codec call.
+
+## Alliance login and stream negotiation
+
+Run the native negotiation and Qt orchestration checks before testing an affected provider:
+
+```sh
+cargo test --manifest-path native/opennow-streamer/Cargo.toml -p opennow-streamer-core nvst_rtsp
+ctest --test-dir build/opennow-qt --output-on-failure -R 'embedded-orchestration|alliance|auth|stream-recovery'
+```
+
+Verify provider-list timeout recovery, a fresh login after an expired device challenge,
+and adding another provider account while already signed in. A failed profile switch must
+leave the original account active and show an error on the account page. Test both desktop
+and console modes; synthetic account fixtures do not prove a provider accepts login.
+
+Video SETUP walks control-URI and Transport forms until the first 200 and
+stops there: live alliance rigs accept the first SETUP but poison the session
+once further forms are tried (later rounds degrade to pure 400s and ANNOUNCE
+is then rejected), while a single SETUP followed by ANNOUNCE succeeds. When
+that first 200 carries no usable video endpoint, the same form is re-issued
+on a bounded pace (3s pauses, at most 3 extra rounds inside the 20s request
+budget) in case the rig's video streamer is still starting. Pure rejections
+still fail fast without retries. If no round yields a peer but the seat
+advertises a CloudMatch bundle peer, negotiation proceeds with it (logged as
+`video-peer-fallback`) instead of failing a seat whose signaling is otherwise
+healthy; without one, `missing-video-peer` remains the terminal negotiation
+error, not a reason to repeatedly reclaim the same seat. Unsupported legacy
+transport is also terminal. Transient network failures retain the existing
+bounded session recovery.
+
+For a partner that still cannot start, reproduce once and export diagnostics. Keep the
+`video-setup` and `video-setup-transport` lines. They describe response status, field
+presence, source/port shape, quoting and key spacing without logging raw addresses,
+credentials or Transport values. Do not add unredacted headers or SDP to bug reports.
+The field-shape diagnostics distinguish a parser incompatibility from missing server
+metadata; a SETUP `200` alone does not prove that an endpoint was negotiated.
+
+Confirm login, catalog load, launch through the first video frame, stop, and reconnect
+with the affected provider before claiming its compatibility issue is fixed. Repeat
+with an NVIDIA account to check the unchanged first SETUP request. Passing synthetic
+fallback and parser tests is not a substitute for this live check.
 
 ## Required live matrix
 
@@ -268,6 +335,25 @@ No cache invalidation is requested. Also inspect the native Store: the loaded co
 stay at 40 while idle; Load more adds one page; route re-entry retains it; category selection
 and See all remain in Store; Ctrl+K finds games outside the loaded page. Scroll through a
 short final row and confirm its posters remain the same size as those in a full row.
+
+## Desktop settings layout and screenshots
+
+Run `ctest --test-dir build/opennow-qt -R qml-settings-layout --output-on-failure`
+to check all nine settings pages at desktop width, compact width, and 1.25 interface
+scale. The checks open Advanced and reject overlapping or overflowing row content.
+
+Capture the actual Qt pages with account-free smoke data:
+
+```sh
+bash scripts/capture-qt-settings.sh build/opennow-qt/opennow-qt /absolute/path/settings-captures
+```
+
+The script captures every page, compact and scaled views, expanded conditional
+settings, statistics customization, and shortcuts. Full-page images resize the
+window to the page content, capped at 3840 pixels high; a separate bottom capture
+covers the expanded Stream page. Each image has a matching runtime log. On Linux,
+the script uses Xvfb when `DISPLAY` is unset. These fixtures never start the core
+or persist account preferences.
 
 ## Desktop settings motion
 

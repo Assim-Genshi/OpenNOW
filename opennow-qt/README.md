@@ -8,6 +8,13 @@ and is the start of the shell-neutral application core. See
 For a sandboxed Linux x86_64 package, follow [Build and install the Flatpak](packaging/flatpak/README.md).
 The separate **Qt Flatpak build** workflow produces an installable bundle without publishing a release.
 
+If Linux Stream settings show no usable video backend, follow
+[Troubleshoot unavailable Linux video backends](../docs/linux-video-backends.md).
+
+On a Windows hybrid laptop, Stream settings → Graphics processor lists each GPU's
+hardware decode codecs. Automatic uses the first high-performance adapter that
+can decode, so a discrete GPU without a decoder does not hide the integrated GPU.
+
 ## CI checks and manual builds
 
 Pull requests and pushes to `dev` or `main` run workflow lint, packaging-contract
@@ -349,6 +356,19 @@ QT_QPA_PLATFORM=offscreen ./build/opennow-qt/opennow-qt \
 Useful development switches are `--route <name>`, `--overlay <name>`,
 `--reduced-motion`, `--core <path>` and `--screenshot <png-path>`. The test suite
 opens every route and overlay with QML warnings treated as failures.
+
+The desktop free-tier queue selector compares PrintedWaste queue estimates with
+local TCP latency before a new NVIDIA launch. The choice is session-local; “Use
+default region” preserves the saved region. “Don't show again” persists the opt-out,
+which can be reversed under Settings → Network → Free-tier queue selector.
+Paid, unknown-tier, alliance, and console-mode launches do not show this dialog.
+
+Run `ctest --test-dir build/opennow-qt --output-on-failure -R 'queueselector|qml-queue-selector'`
+for state, interaction, layout, attribution-link, and launch-routing coverage.
+`--smoke-test --desktop --route home --smoke-queue-selector --queue-selector-preview
+--screenshot <absolute-png-path>` captures public-safe sample queues in the real
+desktop shell. Add `--queue-selector-large`, `--smoke-light-theme`, or
+`--smoke-width 960 --smoke-height 540` to check scaling, appearance, and compact layout.
 
 Run `ctest --test-dir build/opennow-qt --output-on-failure -R 'theme-tests|qml-theme-settings'`
 to check all built-in packs in both appearances, accent contrast, preview restoration,

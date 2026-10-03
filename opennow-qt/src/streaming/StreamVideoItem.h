@@ -51,6 +51,7 @@ class StreamVideoItem : public QQuickItem
                    NOTIFY upscalingDenoiseChanged)
     Q_PROPERTY(QVariantMap frameGenerationStats READ frameGenerationStats
                    NOTIFY frameGenerationStatsChanged)
+    Q_PROPERTY(QVariantMap swapStats READ swapStats NOTIFY swapStatsChanged)
 
 public:
     struct RemoteCursorMetadata {
@@ -93,6 +94,7 @@ public:
     int upscalingDenoise() const;
     void setUpscalingDenoise(int value);
     QVariantMap frameGenerationStats() const;
+    QVariantMap swapStats() const;
 
     static void setNativeStreamRuntime(NativeStreamRuntime *runtime);
     [[nodiscard]] static NativeStreamRuntime *nativeStreamRuntime();
@@ -116,6 +118,14 @@ public:
     [[nodiscard]] static quint16 windowsVirtualKey(
         int key, Qt::KeyboardModifiers modifiers = Qt::NoModifier,
         quint32 nativeVirtualKey = 0);
+    [[nodiscard]] static quint16 linuxPhysicalVirtualKey(quint32 nativeScanCode);
+    [[nodiscard]] static quint16 windowsGameplayVirtualKey(
+        int key, Qt::KeyboardModifiers modifiers, quint32 nativeScanCode,
+        quint32 nativeVirtualKey);
+    [[nodiscard]] static quint16 macGameplayVirtualKey(
+        int key, Qt::KeyboardModifiers modifiers, quint32 nativeVirtualKey,
+        bool nativeEvent = false);
+    [[nodiscard]] static quint16 macGameplayVirtualKey(const QKeyEvent *event);
     [[nodiscard]] static quint16 inputModifiers(Qt::KeyboardModifiers modifiers, int key);
     [[nodiscard]] static QString shortcutActionForInput(
         const QVariantMap &bindings, int key, Qt::KeyboardModifiers modifiers);
@@ -137,6 +147,7 @@ signals:
     void upscalingSharpnessChanged();
     void upscalingDenoiseChanged();
     void frameGenerationStatsChanged();
+    void swapStatsChanged();
     void localShortcutRequested(const QString &action);
 
 protected:
@@ -153,6 +164,7 @@ protected:
     void wheelEvent(QWheelEvent *event) override;
     void itemChange(ItemChange change, const ItemChangeData &data) override;
     void geometryChange(const QRectF &newGeometry, const QRectF &oldGeometry) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
     friend class StreamVideoItemTest;
@@ -173,6 +185,10 @@ private:
     void releaseInput();
     void releaseQtMouseButtons();
     void updateCursorConfinement();
+    void updateSwapGate();
+    void syncSwapGate();
+    [[nodiscard]] QString currentSwapGateSource() const;
+    void pushSwapGate();
     [[nodiscard]] static QRect cursorConfinementRect(const QRect &viewport, bool rawRelative);
     void releaseCursorConfinement();
     void submitAbsoluteMouse(const QPointF &position);
@@ -203,8 +219,11 @@ private:
     int m_upscalingSharpness = 10;
     int m_upscalingDenoise = 0;
     QTimer m_frameStatsTimer;
+    QTimer m_swapStatsTimer;
+    QString m_swapGateSource;
     QMetaObject::Connection m_frameSwapConnection;
     QMetaObject::Connection m_frameUpdateConnection;
+    QPointer<QQuickWindow> m_inputWindow;
     bool m_captureActive = false;
     bool m_relativeMouse = false;
     bool m_rawInputActive = false;

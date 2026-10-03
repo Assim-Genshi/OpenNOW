@@ -14,6 +14,18 @@ class LocalizationTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void displayNamesPreserveExactWireIdentifiers()
+    {
+        Localization localization;
+        for (const auto &id : {QStringLiteral("es_419"), QStringLiteral("zh_Hant_TW"),
+                              QStringLiteral("sr-Latn-RS"), QStringLiteral("future_001")}) {
+            QVERIFY(localization.localeDisplayName(id).contains(id));
+        }
+        QCOMPARE(localization.localeDisplayName(QStringLiteral("future_001")), QStringLiteral("future_001"));
+        QVERIFY(!localization.localeDisplayName(QStringLiteral("de")).isEmpty());
+        QCOMPARE(localization.locale(), QStringLiteral("system"));
+    }
+
     void loadsAvailableLocalesAndUsesEnglishFallback()
     {
         Localization localization;
@@ -32,8 +44,11 @@ private slots:
         localization.setLocale(QStringLiteral("de-DE"));
         QCOMPARE(localization.effectiveLocale(), QStringLiteral("de"));
         QCOMPARE(localization.translate(nullptr, "Back"), QStringLiteral("Zurück"));
+        QCOMPARE(localization.translate(nullptr, "Reset to defaults"),
+                 QStringLiteral("Auf Standardeinstellungen zurücksetzen"));
 
         localization.setLocale(QStringLiteral("en"));
+        QCOMPARE(localization.translate(nullptr, "Reset to defaults"), QStringLiteral("Reset to defaults"));
         QCOMPARE(localization.text(QStringLiteral("library.gameCount"), {{QStringLiteral("count"), 2}}),
                  QStringLiteral("2 games"));
     }

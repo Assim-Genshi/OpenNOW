@@ -15,6 +15,7 @@ on:
         description: Base64 Ed25519 public key pinned into every build
         required: true
         type: string
+        default: HoyKVmfuH+KDioPCJJNxOB2e/bXJoOALSjo1QeMsDlk=
       windows_signing_mode:
         description: Windows platform signing (Ed25519 update signing is always required)
         required: true
@@ -69,6 +70,12 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+
+      - name: Validate the production update key
+        env:
+          OPENNOW_UPDATE_PUBLIC_KEY: ${{ inputs.update_public_key }}
+          PUBLISH_RELEASE: "true"
+        run: python3 opennow-qt/packaging/sign_nightly_release.py preflight
 
       - name: Record source commit
         id: source
@@ -148,7 +155,9 @@ jobs:
         uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639
         with:
           key: qt-release-${{ matrix.runner }}-${{ matrix.arch }}
+          restore-keys: qt-release-${{ matrix.runner }}-${{ matrix.arch }}
           max-size: 500M
+          verbose: 1
 
       - name: Build and cache SDL3
         uses: ./.github/actions/sdl3
@@ -180,6 +189,7 @@ jobs:
           LINUXDEPLOY_ARCH: ${{ matrix.linuxdeploy_arch }}
           LINUXDEPLOY_SHA256: ${{ matrix.linuxdeploy_sha256 }}
           QT_PLUGIN_SHA256: ${{ matrix.qt_plugin_sha256 }}
+          PACKAGE_ARCH: ${{ matrix.arch }}
         run: |
           export LD_LIBRARY_PATH="$RUNNER_TEMP/SDL-install/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           mkdir -p build/release-artifacts
@@ -196,6 +206,11 @@ jobs:
           echo "$LINUXDEPLOY_SHA256  build/linuxdeploy-${LINUXDEPLOY_ARCH}.AppImage" | sha256sum --check --strict
           echo "$QT_PLUGIN_SHA256  build/linuxdeploy-plugin-qt-${LINUXDEPLOY_ARCH}.AppImage" | sha256sum --check --strict
           chmod +x build/linuxdeploy-*.AppImage build/linuxdeploy-plugin-qt-*.AppImage
+          install -Dm644 opennow-qt/packaging/opennow-vaapi-hook.sh \
+            build/AppDir/apprun-hooks/opennow-vaapi-hook.sh
+          export LDAI_UPDATE_INFORMATION
+          LDAI_UPDATE_INFORMATION=$(python3 opennow-qt/packaging/appimage_updates.py information \
+            --channel stable --arch "$PACKAGE_ARCH")
           QMAKE="$QT_ROOT_DIR/bin/qmake" QML_SOURCES_PATHS="$PWD/opennow-qt/qml" \
           OUTPUT="OpenNOW-Qt-${{ inputs.version }}-Linux-${{ matrix.arch }}.AppImage" \
             "build/linuxdeploy-${LINUXDEPLOY_ARCH}.AppImage" \
@@ -204,6 +219,10 @@ jobs:
               --icon-file build/AppDir/usr/share/icons/hicolor/scalable/apps/io.github.opencloudgaming.OpenNOW.svg \
               --library "$(pkg-config --variable=libdir libva)/libva.so.2" \
               --library "$(pkg-config --variable=libdir libva-drm)/libva-drm.so.2" \
+              --exclude-library libglib-2.0.so.0 \
+              --exclude-library libgobject-2.0.so.0 \
+              --exclude-library libgio-2.0.so.0 \
+              --exclude-library libgmodule-2.0.so.0 \
               --plugin qt --output appimage
           test -f build/AppDir/usr/lib/libva.so.2
           test -f build/AppDir/usr/lib/libva-drm.so.2
@@ -212,8 +231,11 @@ jobs:
           test -f build/AppDir/usr/plugins/platforms/libqwayland-generic.so
           test -f build/AppDir/usr/plugins/wayland-shell-integration/libxdg-shell.so
           LD_LIBRARY_PATH="$PWD/build/AppDir/usr/lib:$LD_LIBRARY_PATH" \
-            python3 opennow-qt/packaging/verify_linux_package.py build/AppDir/usr/bin
-          mv OpenNOW-Qt-*.AppImage build/release-artifacts/
+            python3 opennow-qt/packaging/verify_linux_package.py build/AppDir/usr/bin --appdir build/AppDir
+          python3 opennow-qt/packaging/appimage_updates.py verify \
+            --channel stable --arch "$PACKAGE_ARCH" \
+            --appimage "OpenNOW-Qt-${{ inputs.version }}-Linux-${PACKAGE_ARCH}.AppImage"
+          mv OpenNOW-Qt-*.AppImage OpenNOW-Qt-*.AppImage.zsync build/release-artifacts/
           cpack --config build/qt-release/CPackConfig.cmake \
             -D "CPACK_PROJECT_CONFIG_FILE=$PWD/opennow-qt/packaging/LinuxBundledDeb.cmake" \
             -D "OPENNOW_APPDIR=$PWD/build/AppDir" \
@@ -233,13 +255,14 @@ jobs:
           env -u QT_PLUGIN_PATH -u QT_QPA_PLATFORM_PLUGIN_PATH \
             -u QML2_IMPORT_PATH -u QML_IMPORT_PATH -u LD_LIBRARY_PATH \
             "$appimage" --smoke-test --allow-multiple-instances --route home --reduced-motion
-          (cd build/release-artifacts && sha256sum -- *.AppImage *.deb > SHA256SUMS)
+          (cd build/release-artifacts && sha256sum -- *.AppImage *.AppImage.zsync *.deb > SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
         with:
           name: opennow-qt-${{ inputs.version }}-linux-${{ matrix.arch }}-signed
           path: |
             build/release-artifacts/*.AppImage
+            build/release-artifacts/*.AppImage.zsync
             build/release-artifacts/*.deb
             build/release-artifacts/SHA256SUMS
           if-no-files-found: error
@@ -374,7 +397,9 @@ jobs:
         uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639
         with:
           key: qt-release-windows-2025-${{ matrix.arch }}
+          restore-keys: qt-release-windows-2025-${{ matrix.arch }}
           max-size: 1G
+          verbose: 1
 
       - name: Build and cache SDL3
         uses: ./.github/actions/sdl3
@@ -448,6 +473,35 @@ jobs:
           Invoke-OpenNowSignTool sign /f $pfx /p $env:WINDOWS_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $msi.FullName
           Invoke-OpenNowSignTool verify /pa /all $msi.FullName
 
+      - name: Build setup.exe
+        shell: pwsh
+        env:
+          SETUP_VERSION: ${{ inputs.version }}
+          SETUP_ARCH: ${{ matrix.arch }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = @(Get-ChildItem build/release-artifacts -Filter *.zip)
+          if ($zip.Count -ne 1) { throw "Expected one portable ZIP" }
+          $payload = Join-Path $env:RUNNER_TEMP "setup-payload"
+          if (Test-Path $payload) { Remove-Item $payload -Recurse -Force }
+          Expand-Archive $zip[0].FullName $payload
+          $setup = Join-Path (Resolve-Path build/release-artifacts) ([IO.Path]::GetFileNameWithoutExtension($zip[0].Name) + "-setup.exe")
+          ./opennow-qt/packaging/windows/build-setup.ps1 -Payload $payload -Version $env:SETUP_VERSION -Arch $env:SETUP_ARCH -OutputFile $setup
+
+      - name: Authenticode-sign setup.exe
+        if: inputs.windows_signing_mode == 'authenticode'
+        shell: pwsh
+        env:
+          WINDOWS_PFX_PASSWORD: ${{ secrets.OPENNOW_WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          . ./opennow-qt/packaging/windows-release.ps1
+          $pfx = Join-Path $env:RUNNER_TEMP "opennow-signing.pfx"
+          $setup = @(Get-ChildItem build/release-artifacts -Filter *-setup.exe)
+          if ($setup.Count -ne 1) { throw "Expected one setup.exe" }
+          Invoke-OpenNowSignTool sign /f $pfx /p $env:WINDOWS_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $setup[0].FullName
+          Invoke-OpenNowSignTool verify /pa /all $setup[0].FullName
+
       - name: Verify MSI and portable ZIP payloads
         shell: pwsh
         env:
@@ -480,7 +534,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          Get-ChildItem build/release-artifacts -File | Where-Object { $_.Extension -in ".msi", ".zip" } | Get-FileHash -Algorithm SHA256 |
+          Get-ChildItem build/release-artifacts -File | Where-Object { $_.Extension -eq ".msi" -or $_.Extension -eq ".zip" -or $_.Name -like "*-setup.exe" } | Get-FileHash -Algorithm SHA256 |
             ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } |
             Set-Content build/release-artifacts/SHA256SUMS
 
@@ -495,6 +549,7 @@ jobs:
           path: |
             build/release-artifacts/*.msi
             build/release-artifacts/*.zip
+            build/release-artifacts/*-setup.exe
             build/release-artifacts/SHA256SUMS
           if-no-files-found: error
 
@@ -542,7 +597,9 @@ jobs:
         uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639
         with:
           key: qt-release-macos-arm64
+          restore-keys: qt-release-macos-arm64
           max-size: 1G
+          verbose: 1
 
       - name: Build and cache SDL3
         uses: ./.github/actions/sdl3
@@ -677,11 +734,12 @@ jobs:
                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
               try:
                   core.stdin.write('{"type":"request","id":"package-core","method":"core.hello",'
-                                   '"params":{"protocolVersion":1}}\n')
+                                   '"params":{"protocolVersion":5}}\n')
                   core.stdin.flush()
                   assert select.select([core.stdout], [], [], 30)[0], "Core handshake timed out"
                   response = json.loads(core.stdout.readline())
                   assert response.get("id") == "package-core" and response.get("ok") is True, response
+                  assert {"catalog.libraryPages.v1", "catalog.metadata.v1", "account.syncObservation.v1", "catalog.languages.v1", "queue.servers.v1"}.issubset(response["result"]["capabilities"]), response
               finally:
                   core.kill()
                   core.communicate(timeout=5)
@@ -739,16 +797,17 @@ jobs:
           expected=$(for arch in x64 arm64; do
             printf 'OpenNOW-Qt-%s-Linux-%s.AppImage\nOpenNOW-Qt-%s-Linux-%s.deb\n' \
               "$RELEASE_VERSION" "$arch" "$RELEASE_VERSION" "$arch"
-            printf 'OpenNOW-Qt-%s-Windows-%s.msi\nOpenNOW-Qt-%s-Windows-%s.zip\n' \
-              "$RELEASE_VERSION" "$arch" "$RELEASE_VERSION" "$arch"
+            printf 'OpenNOW-Qt-%s-Linux-%s.AppImage.zsync\n' "$RELEASE_VERSION" "$arch"
+            printf 'OpenNOW-Qt-%s-Windows-%s.msi\nOpenNOW-Qt-%s-Windows-%s.zip\nOpenNOW-Qt-%s-Windows-%s-setup.exe\n' \
+              "$RELEASE_VERSION" "$arch" "$RELEASE_VERSION" "$arch" "$RELEASE_VERSION" "$arch"
           done
           printf 'OpenNOW-Qt-%s-Darwin-arm64.dmg\nOpenNOW-Qt-%s-Darwin-arm64.zip\n' \
             "$RELEASE_VERSION" "$RELEASE_VERSION")
           actual=$(find candidate -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort)
           [[ "$actual" == "$(printf '%s\n' "$expected" | LC_ALL=C sort)" ]]
           assets=$(find candidate -type f \( -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' \
-            -o -name '*.deb' -o -name '*.zip' \) | wc -l)
-          [[ "$assets" -eq 10 ]]
+            -o -name '*.AppImage.zsync' -o -name '*.deb' -o -name '*.zip' -o -name '*-setup.exe' \) | wc -l)
+          [[ "$assets" -eq 14 ]]
 
           signing_dir=$(mktemp -d "$RUNNER_TEMP/opennow-update-signing.XXXXXX")
           trap 'rm -rf "$signing_dir"' EXIT
@@ -785,7 +844,7 @@ jobs:
               > "$temporary"
             mv "$temporary" "$manifest"
           done < <(find candidate -type f \( -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' \
-            -o -name '*.deb' -o -name '*.zip' \) -print0)
+            -o -name '*.AppImage.zsync' -o -name '*.deb' -o -name '*.zip' -o -name '*-setup.exe' \) -print0)
 
           manifests=$(find candidate -type f -name '*.manifest.json' | wc -l)
           [[ "$manifests" -eq "$assets" ]]

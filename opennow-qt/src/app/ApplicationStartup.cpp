@@ -6,6 +6,7 @@
 #include "input/ControllerInput.h"
 #include "core/CoreClient.h"
 #include "input/InputModeTracker.h"
+#include "input/SonySnapshotWire.h"
 #include "localization/Localization.h"
 #include "streaming/rendering/LinuxVulkanGraphics.h"
 #include "streaming/rendering/HdrOutput.h"
@@ -20,6 +21,7 @@
 #include <QGuiApplication>
 #include <QIcon>
 #include <QElapsedTimer>
+#include <QTimer>
 #include <QFont>
 #include <QFontDatabase>
 #include <QQmlApplicationEngine>
@@ -111,9 +113,10 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
     application.setFont(applicationFont);
     const auto arguments = application.arguments();
     SingleInstance singleInstance;
-    if (!arguments.contains(u"--allow-multiple-instances"_s)
-            && !singleInstance.acquire(arguments)) {
-        return EXIT_SUCCESS;
+    if (!arguments.contains(u"--allow-multiple-instances"_s)) {
+        const auto acquisition = singleInstance.acquire(arguments);
+        if (acquisition == SingleInstance::Acquisition::Forwarded) return EXIT_SUCCESS;
+        if (acquisition == SingleInstance::Acquisition::Failed) return EXIT_FAILURE;
     }
     AppController controller;
     QObject::connect(&controller, &AppController::restartRequested, &application, [&] {
@@ -183,6 +186,16 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
                      &nativeStreamRuntime, [&nativeStreamRuntime](quint32 action) {
                          nativeStreamRuntime.submitLocalAction(action);
                      });
+    QObject::connect(&controllerInput, &ControllerInput::deviceClaimsChanged,
+                     &nativeStreamRuntime, [&controllerInput, &nativeStreamRuntime] {
+                         nativeStreamRuntime.replaceSdlDeviceClaims(controllerInput.deviceClaims());
+                     });
+    QObject::connect(
+        &controllerInput, &ControllerInput::sonySnapshot, &nativeStreamRuntime,
+        [&nativeStreamRuntime](const ControllerInput::SonySnapshot &snapshot) {
+            nativeStreamRuntime.submitSonySnapshot(openNowWireSonySnapshot(snapshot));
+        });
+    nativeStreamRuntime.replaceSdlDeviceClaims(controllerInput.deviceClaims());
 #endif
     InputModeTracker inputModeTracker(&controller);
     application.installEventFilter(&inputModeTracker);
@@ -208,8 +221,17 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
     QObject::connect(&localization, &Localization::localeChanged, &hdrOutput, &HdrOutput::changed);
     QObject::connect(&hdrOutput, &HdrOutput::changed, &coreClient, [&] {
         coreClient.setNativeHdrSupported(hdrOutput.supported());
+        const auto display = hdrOutput.displayData();
+        CoreClient::NativeHdrDisplay snapshot;
+        snapshot.available = display.available;
+        snapshot.minimumNits = display.minimumNits;
+        snapshot.maximumNits = display.maximumNits;
+        snapshot.maximumFullFrameNits = display.maximumFullFrameNits;
+        snapshot.chromaticity = display.chromaticity;
+        coreClient.setNativeHdrDisplay(snapshot);
     });
     qmlRegisterType<HdrChromeEffect>("OpenNOW", 1, 0, "HdrChromeEffect");
+    qmlRegisterType<QTimer>("OpenNOW", 1, 0, "NativeTimer");
     qmlRegisterUncreatableType<MacAwdlController>("OpenNOW", 1, 0, "MacAwdlController",
                                                 u"Use the application-owned MacAwdl instance"_s);
     MacAwdlController macAwdl;

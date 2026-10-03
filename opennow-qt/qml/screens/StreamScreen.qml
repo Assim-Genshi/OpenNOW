@@ -232,7 +232,7 @@ FocusScope {
             Row {
                 anchors.horizontalCenter: parent.horizontalCenter
                 spacing: 12
-                GlassButton { width: 260; text: qsTr("Stop session"); glyph: "B"; onClicked: ShellStore.stopStreamingSession(); Component.onCompleted: forceActiveFocus() }
+                GlassButton { width: 260; text: qsTr("Stop session"); glyph: "B"; onClicked: ShellStore.requestStreamExitConfirmation(); Component.onCompleted: forceActiveFocus() }
                 GlassButton { width: 260; text: root.failed ? qsTr("Retry media") : qsTr("Session guide"); glyph: root.failed ? "↻" : "≡"; primary: true; onClicked: root.failed ? ShellStore.retryNativeStreamer() : AppController.showOverlay("guide-session") }
             }
         }
@@ -271,7 +271,7 @@ FocusScope {
             anchors.centerIn: parent
             spacing: 22
             ControllerGlyph { glyph: "GUIDE"; label: qsTr("Session") }
-            ControllerGlyph { glyph: "F3"; keyboard: true; label: qsTr("Stats") }
+            ControllerGlyph { visible: ShellStore.settings.shortcutToggleStats !== ""; glyph: String(ShellStore.settings.shortcutToggleStats ?? "Ctrl+N"); keyboard: true; label: qsTr("Stats") }
             ControllerGlyph { glyph: "F11"; keyboard: true; label: qsTr("Fullscreen") }
         }
     }

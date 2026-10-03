@@ -1,10 +1,13 @@
 #include "core/CoreClient.h"
+#include "media/MediaPaths.h"
 
 #include <QSignalSpy>
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QElapsedTimer>
 #include <QRegularExpression>
 #include <QScopeGuard>
@@ -31,19 +34,68 @@ class CoreClientTest final : public QObject
     Q_OBJECT
 
 private slots:
+    void deliversSettingsChangesBeforeTheirAcknowledgements()
+    {
+        CoreClient client;
+        QVERIFY(client.start(fakeCorePath()));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 2'000);
+        QStringList delivered;
+        connect(&client, &CoreClient::eventReceived, this, [&](const QString &name, const QJsonObject &) {
+            if (name == QStringLiteral("settings.changed"))
+                delivered.append(QStringLiteral("event"));
+        });
+        connect(&client, &CoreClient::responseReceived, this, [&](const QString &, const QJsonObject &result) {
+            if (result.value(QStringLiteral("key")).toString() == QStringLiteral("launchInConsoleMode"))
+                delivered.append(QStringLiteral("response"));
+        });
+        QVERIFY(!client.request(QStringLiteral("settings.set"),
+            {{QStringLiteral("key"), QStringLiteral("launchInConsoleMode")},
+             {QStringLiteral("value"), true}}).isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(delivered.size(), 2, 2'000);
+        QCOMPARE(delivered, (QStringList{QStringLiteral("event"), QStringLiteral("response")}));
+    }
+
+    void acknowledgesOnlyAcceptedCreateResponses()
+    {
+        CoreClient client;
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QVERIFY(client.start(fakeCorePath()));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 2'000);
+        responses.clear();
+        const auto accepted = client.request(QStringLiteral("session.create"));
+        QTRY_VERIFY_WITH_TIMEOUT(std::any_of(responses.begin(), responses.end(), [&](const auto &response) {
+            return response.at(0).toString() == accepted;
+        }), 2'000);
+        const auto cancelled = client.request(QStringLiteral("session.create"), {{QStringLiteral("delayReceipt"), true}});
+        QVERIFY(client.cancel(cancelled));
+        const auto query = client.request(QStringLiteral("test.create-receipts"));
+        QTRY_VERIFY_WITH_TIMEOUT(std::any_of(responses.begin(), responses.end(), [&](const auto &response) {
+            return response.at(0).toString() == query;
+        }), 2'000);
+        for (const auto &response : responses) {
+            QVERIFY(response.at(0).toString() != cancelled);
+            if (response.at(0).toString() == query)
+                QCOMPARE(response.at(1).toJsonObject().value(QStringLiteral("receipts")).toInt(), 1);
+        }
+    }
+
 #ifdef Q_OS_LINUX
-    void passesFlatpakPicturesDirectoryToCore_data()
+    void passesResolvedPicturesRootToCore_data()
     {
         QTest::addColumn<QByteArray>("flatpakId");
         QTest::addColumn<QByteArray>("picturesOverride");
-        QTest::newRow("flatpak-xdg-pictures") << QByteArray("io.github.opencloudgaming.OpenNOW") << QByteArray{};
-        QTest::newRow("flatpak-explicit-override") << QByteArray("io.github.opencloudgaming.OpenNOW") << QByteArray("/custom/captures");
-        QTest::newRow("flatpak-empty-override") << QByteArray("io.github.opencloudgaming.OpenNOW") << QByteArray("");
-        QTest::newRow("no-flatpak-environment") << QByteArray{} << QByteArray{};
-        QTest::newRow("native-explicit-override") << QByteArray{} << QByteArray("/custom/captures");
+        const QByteArray opennowFlatpakId("io.github.opencloudgaming.OpenNOW");
+        const QByteArray explicitOverride("/custom/captures");
+        const QByteArray emptyOverride("");
+        QTest::newRow("native-xdg-pictures") << QByteArray{} << QByteArray{};
+        QTest::newRow("native-explicit-override") << QByteArray{} << explicitOverride;
+        QTest::newRow("native-empty-override") << QByteArray{} << emptyOverride;
+        QTest::newRow("flatpak-xdg-pictures") << opennowFlatpakId << QByteArray{};
+        QTest::newRow("flatpak-explicit-override") << opennowFlatpakId << explicitOverride;
+        QTest::newRow("flatpak-empty-override") << opennowFlatpakId << emptyOverride;
     }
 
-    void passesFlatpakPicturesDirectoryToCore()
+    void passesResolvedPicturesRootToCore()
     {
         QFETCH(QByteArray, flatpakId);
         QFETCH(QByteArray, picturesOverride);
@@ -74,6 +126,11 @@ private slots:
         else qputenv("OPENNOW_PICTURES_DIR", picturesOverride);
         QCOMPARE(QStandardPaths::writableLocation(QStandardPaths::PicturesLocation), customPictures);
 
+        const auto expected = picturesOverride.isNull() ? customPictures
+                                                         : QString::fromUtf8(picturesOverride);
+        QCOMPARE(mediaPicturesRoot(), expected);
+        if (!expected.isEmpty()) QVERIFY(QDir::isAbsolutePath(expected));
+
         CoreClient client;
         QSignalSpy responses(&client, &CoreClient::responseReceived);
         QVERIFY(client.start(fakeCorePath()));
@@ -82,13 +139,107 @@ private slots:
         client.request(QStringLiteral("test.app-context"));
         QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 2'000);
         const auto context = qvariant_cast<QJsonObject>(responses.first().at(1));
-        const auto flatpak = !flatpakId.isEmpty() || QFileInfo::exists(QStringLiteral("/.flatpak-info"));
-        const auto expected = !picturesOverride.isNull() ? QString::fromUtf8(picturesOverride)
-            : flatpak ? customPictures : QString{};
         QCOMPARE(context.value(QStringLiteral("picturesDirectory")).toString(), expected);
-        QCOMPARE(context.value(QStringLiteral("hasPicturesDirectory")).toBool(), flatpak || !picturesOverride.isNull());
+        QCOMPARE(context.value(QStringLiteral("hasPicturesDirectory")).toBool(), true);
+    }
+
+    void reappliesPicturesRootWhenCoreRestarts()
+    {
+        QTemporaryDir firstOverride;
+        QTemporaryDir secondOverride;
+        QVERIFY(firstOverride.isValid() && secondOverride.isValid());
+        const auto previousPictures = qgetenv("OPENNOW_PICTURES_DIR");
+        const auto restoreEnvironment = qScopeGuard([&] {
+            if (previousPictures.isNull()) qunsetenv("OPENNOW_PICTURES_DIR");
+            else qputenv("OPENNOW_PICTURES_DIR", previousPictures);
+        });
+        qputenv("OPENNOW_PICTURES_DIR", firstOverride.path().toUtf8());
+
+        CoreClient client;
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QSignalSpy failures(&client, &CoreClient::requestFailed);
+        QVERIFY(client.start(fakeCorePath()));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 2'000);
+        responses.clear();
+        client.request(QStringLiteral("test.app-context"));
+        QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 2'000);
+        QCOMPARE(qvariant_cast<QJsonObject>(responses.first().at(1))
+                     .value(QStringLiteral("picturesDirectory")).toString(),
+                 firstOverride.path());
+
+        qputenv("OPENNOW_PICTURES_DIR", secondOverride.path().toUtf8());
+        QVERIFY(!client.request(QStringLiteral("test.exit")).isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(!failures.isEmpty(), 2'000);
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 4'000);
+        responses.clear();
+        client.request(QStringLiteral("test.app-context"));
+        QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 2'000);
+        QCOMPARE(qvariant_cast<QJsonObject>(responses.first().at(1))
+                     .value(QStringLiteral("picturesDirectory")).toString(),
+                 secondOverride.path());
     }
 #endif
+
+    void realCoreSharesTheResolvedPicturesRoot()
+    {
+        QTemporaryDir overrideRoot;
+        QTemporaryDir dataDir;
+        QVERIFY(overrideRoot.isValid() && dataDir.isValid());
+        const auto previousPictures = qgetenv("OPENNOW_PICTURES_DIR");
+        const auto restoreEnvironment = qScopeGuard([&] {
+            if (previousPictures.isNull()) qunsetenv("OPENNOW_PICTURES_DIR");
+            else qputenv("OPENNOW_PICTURES_DIR", previousPictures);
+        });
+        const auto program = QString::fromUtf8(OPENNOW_TEST_CORE_PATH);
+        QVERIFY2(QFileInfo(program).isExecutable(), qPrintable(program));
+
+        qputenv("OPENNOW_PICTURES_DIR", overrideRoot.path().toUtf8());
+        CoreClient client;
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QVERIFY(client.start(program, {QStringLiteral("--data-dir"), dataDir.path()}));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 5'000);
+        responses.clear();
+        client.request(QStringLiteral("media.root.get"));
+        QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 5'000);
+        const auto root = qvariant_cast<QJsonObject>(responses.first().at(1))
+                              .value(QStringLiteral("path")).toString();
+        QCOMPARE(QDir::cleanPath(root),
+                 QDir::cleanPath(QDir(overrideRoot.path()).filePath(QStringLiteral("OpenNOW"))));
+        QCOMPARE(QDir::cleanPath(mediaRecordingsDirectory()),
+                 QDir::cleanPath(QDir(root).filePath(QStringLiteral("Recordings"))));
+        QCOMPARE(QDir::cleanPath(mediaScreenshotsDirectory()),
+                 QDir::cleanPath(QDir(root).filePath(QStringLiteral("Screenshots"))));
+        client.stop();
+    }
+
+    void realCoreTreatsAnEmptyPicturesMarkerAsUnavailable()
+    {
+        QTemporaryDir dataDir;
+        QVERIFY(dataDir.isValid());
+        const auto previousPictures = qgetenv("OPENNOW_PICTURES_DIR");
+        const auto restoreEnvironment = qScopeGuard([&] {
+            if (previousPictures.isNull()) qunsetenv("OPENNOW_PICTURES_DIR");
+            else qputenv("OPENNOW_PICTURES_DIR", previousPictures);
+        });
+        const auto program = QString::fromUtf8(OPENNOW_TEST_CORE_PATH);
+        QVERIFY2(QFileInfo(program).isExecutable(), qPrintable(program));
+
+        qputenv("OPENNOW_PICTURES_DIR", "");
+        if (!qEnvironmentVariableIsSet("OPENNOW_PICTURES_DIR"))
+            QSKIP("This platform cannot set an empty environment variable in-process");
+
+        CoreClient client;
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QSignalSpy failures(&client, &CoreClient::requestFailed);
+        QVERIFY(client.start(program, {QStringLiteral("--data-dir"), dataDir.path()}));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 5'000);
+        responses.clear();
+        client.request(QStringLiteral("media.list"));
+        QTRY_VERIFY_WITH_TIMEOUT(!failures.isEmpty(), 5'000);
+        QCOMPARE(failures.last().at(1).toString(), QStringLiteral("media_list_failed"));
+        QVERIFY(responses.isEmpty());
+        client.stop();
+    }
 
     void readsGraphicsPreferencesBeforeStartingTheCore()
     {
@@ -260,8 +411,71 @@ private slots:
     {
         CoreClient client;
         QCOMPARE(client.state(), QStringLiteral("stopped"));
-        QCOMPARE(client.protocolVersion(), 1);
+        QCOMPARE(client.protocolVersion(), 5);
         QVERIFY(client.lastError().isEmpty());
+    }
+
+    void rejectsOldCoreBeforeSendingCatalogRequests()
+    {
+        const auto previous = qgetenv("OPENNOW_TEST_OLD_CORE");
+        const auto restore = qScopeGuard([previous] {
+            if (previous.isNull()) qunsetenv("OPENNOW_TEST_OLD_CORE");
+            else qputenv("OPENNOW_TEST_OLD_CORE", previous);
+        });
+        qputenv("OPENNOW_TEST_OLD_CORE", "1");
+        QStringList errors;
+        CoreClient client;
+        connect(&client, &CoreClient::lastErrorChanged, &client, [&] { errors.append(client.lastError()); });
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QVERIFY(client.start(fakeCorePath()));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("failed"), 2'000);
+        QVERIFY(errors.contains(QStringLiteral("Core protocol version is incompatible")));
+        QVERIFY(client.request(QStringLiteral("catalog.library.list")).isEmpty());
+        QVERIFY(responses.isEmpty());
+    }
+
+    void rejectsCoreWithoutQueueCapabilityBeforeSendingProductRequests()
+    {
+        const auto previous = qgetenv("OPENNOW_TEST_NO_QUEUE_CAPABILITY");
+        const auto restore = qScopeGuard([previous] {
+            if (previous.isNull()) qunsetenv("OPENNOW_TEST_NO_QUEUE_CAPABILITY");
+            else qputenv("OPENNOW_TEST_NO_QUEUE_CAPABILITY", previous);
+        });
+        qputenv("OPENNOW_TEST_NO_QUEUE_CAPABILITY", "1");
+        QStringList errors;
+        CoreClient client;
+        connect(&client, &CoreClient::lastErrorChanged, &client, [&] { errors.append(client.lastError()); });
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QVERIFY(client.start(fakeCorePath()));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("failed"), 2'000);
+        QVERIFY(errors.contains(QStringLiteral("The packaged core lacks a required capability: queue.servers.v1")));
+        QVERIFY(client.request(QStringLiteral("queue.servers.list")).isEmpty());
+        QVERIFY(client.request(QStringLiteral("catalog.library.list")).isEmpty());
+        QVERIFY(responses.isEmpty());
+    }
+
+    void rejectsCatalogRequestsDuringHandshakeAndProtocolFailure()
+    {
+        const auto previous = qgetenv("OPENNOW_TEST_OLD_CORE");
+        const auto restore = qScopeGuard([previous] {
+            if (previous.isNull()) qunsetenv("OPENNOW_TEST_OLD_CORE");
+            else qputenv("OPENNOW_TEST_OLD_CORE", previous);
+        });
+        qputenv("OPENNOW_TEST_OLD_CORE", "1");
+        QStringList observedStates;
+        QStringList admittedStates;
+        CoreClient client;
+        connect(&client, &CoreClient::stateChanged, &client, [&] {
+            const auto state = client.state();
+            if (state != QStringLiteral("handshaking") && state != QStringLiteral("failed")) return;
+            observedStates.append(state);
+            if (!client.request(QStringLiteral("catalog.library.list")).isEmpty())
+                admittedStates.append(state);
+        });
+        QVERIFY(client.start(fakeCorePath()));
+        QTRY_VERIFY_WITH_TIMEOUT(observedStates.contains(QStringLiteral("failed")), 2'000);
+        QVERIFY(observedStates.contains(QStringLiteral("handshaking")));
+        QVERIFY2(admittedStates.isEmpty(), qPrintable(admittedStates.join(QStringLiteral(", "))));
     }
 
     void rejectsInvalidStartAndRequest()
@@ -278,7 +492,8 @@ private slots:
         QSignalSpy responses(&client, &CoreClient::responseReceived);
         QVERIFY(client.start(fakeCorePath()));
         QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 2'000);
-        for (const auto &method : {QStringLiteral("session.create"), QStringLiteral("streamer.prepare")}) {
+        for (const auto &method : {QStringLiteral("session.create"), QStringLiteral("streamer.prepare"),
+                                  QStringLiteral("settings.choices.get")}) {
             for (bool supported : {false, true, false}) {
                 responses.clear();
                 client.setNativeHdrSupported(supported);
@@ -293,11 +508,111 @@ private slots:
                 QCOMPARE(actual.value(QStringLiteral("appId")), params.value(QStringLiteral("appId")));
                 const auto runtime = actual.value(QStringLiteral("runtimeCapabilities")).toObject();
                 QCOMPARE(runtime.value(QStringLiteral("nativeHdrSupported")).toBool(), supported);
+                QVERIFY(!runtime.contains(QStringLiteral("nativeHdrDisplay")));
                 QCOMPARE(runtime.value(QStringLiteral("protocolVersion")).toInt(), 7);
                 QVERIFY(!actual.contains(QStringLiteral("settings")));
                 QCOMPARE(params.value(QStringLiteral("runtimeCapabilities")).toObject(), capabilities);
             }
         }
+        client.stop();
+    }
+
+    void injectsValidatedNativeHdrDisplayCapability()
+    {
+        CoreClient client;
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QVERIFY(client.start(fakeCorePath()));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 2'000);
+        for (const auto &method : {QStringLiteral("session.create"), QStringLiteral("streamer.prepare"),
+                                  QStringLiteral("settings.choices.get")}) {
+            responses.clear();
+            CoreClient::NativeHdrDisplay display;
+            display.available = true;
+            display.minimumNits = 0.005;
+            display.maximumNits = 620;
+            display.maximumFullFrameNits = 400;
+            display.chromaticity = HdrChromaticity{0.68, 0.32, 0.265, 0.69,
+                                                   0.15, 0.06, 0.3127, 0.329};
+            client.setNativeHdrDisplay(display);
+            QVERIFY(!client.request(method, {{QStringLiteral("appId"), QStringLiteral("123")}}).isEmpty());
+            QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 2'000);
+            const auto runtime = responses.first().at(1).toJsonObject()
+                .value(QStringLiteral("params")).toObject()
+                .value(QStringLiteral("runtimeCapabilities")).toObject();
+            const auto injected = runtime.value(QStringLiteral("nativeHdrDisplay")).toObject();
+            QCOMPARE(injected.value(QStringLiteral("minimumNits")).toDouble(), 0.005);
+            QCOMPARE(injected.value(QStringLiteral("maximumNits")).toDouble(), 620.0);
+            QCOMPARE(injected.value(QStringLiteral("maximumFullFrameNits")).toDouble(), 400.0);
+            QCOMPARE(injected.value(QStringLiteral("redX")).toDouble(), 0.68);
+            QCOMPARE(injected.value(QStringLiteral("redY")).toDouble(), 0.32);
+            QCOMPARE(injected.value(QStringLiteral("greenX")).toDouble(), 0.265);
+            QCOMPARE(injected.value(QStringLiteral("greenY")).toDouble(), 0.69);
+            QCOMPARE(injected.value(QStringLiteral("blueX")).toDouble(), 0.15);
+            QCOMPARE(injected.value(QStringLiteral("blueY")).toDouble(), 0.06);
+            QCOMPARE(injected.value(QStringLiteral("whiteX")).toDouble(), 0.3127);
+            QCOMPARE(injected.value(QStringLiteral("whiteY")).toDouble(), 0.329);
+            responses.clear();
+            client.setNativeHdrSupported(true);
+            client.setNativeHdrDisplay({});
+            const QJsonObject stale{
+                {QStringLiteral("runtimeCapabilities"),
+                 QJsonObject{{QStringLiteral("nativeHdrDisplay"),
+                              QJsonObject{{QStringLiteral("minimumNits"), 0.005},
+                                          {QStringLiteral("maximumNits"), 620}}},
+                             {QStringLiteral("protocolVersion"), 7}}}};
+            QVERIFY(!client.request(method, stale).isEmpty());
+            QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 2'000);
+            const auto absent = responses.first().at(1).toJsonObject()
+                .value(QStringLiteral("params")).toObject()
+                .value(QStringLiteral("runtimeCapabilities")).toObject();
+            QCOMPARE(absent.value(QStringLiteral("nativeHdrSupported")).toBool(), true);
+            QVERIFY(!absent.contains(QStringLiteral("nativeHdrDisplay")));
+        }
+        client.stop();
+    }
+
+    void injectedHdrOutputControlsRealCoreColorDescriptors()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        CoreClient client;
+        QSignalSpy responses(&client, &CoreClient::responseReceived);
+        QSignalSpy failures(&client, &CoreClient::requestFailed);
+        const auto program = QString::fromUtf8(OPENNOW_TEST_CORE_PATH);
+        QVERIFY2(QFileInfo(program).isExecutable(), qPrintable(program));
+        QVERIFY(client.start(program, {QStringLiteral("--data-dir"), directory.path()}));
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), QStringLiteral("ready"), 5'000);
+        responses.clear();
+        QVERIFY(!client.request(QStringLiteral("settings.set"),
+            {{QStringLiteral("key"), QStringLiteral("enableHdr")}, {QStringLiteral("value"), true}}).isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 5'000);
+        for (bool supported : {false, true, false}) {
+            client.setNativeHdrSupported(supported);
+            CoreClient::NativeHdrDisplay display;
+            display.available = true;
+            display.minimumNits = 0.005;
+            display.maximumNits = 620;
+            client.setNativeHdrDisplay(display);
+            const auto capabilities = QJsonDocument::fromJson(R"({"protocolVersion":7,
+                "videoBackends":[{"backend":"vaapi","available":true,"codecs":[
+                    {"codec":"h265","available":true,"hdrSupported":true,
+                     "colorQualities":["8bit_420","10bit_420"],"hdrColorQualities":["10bit_420"]}]}]})").object();
+            auto callerCapabilities = capabilities;
+            callerCapabilities.insert(QStringLiteral("nativeHdrSupported"), !supported);
+            responses.clear();
+            QVERIFY(!client.request(QStringLiteral("settings.choices.get"),
+                {{QStringLiteral("runtimeCapabilities"), callerCapabilities}}).isEmpty());
+            QTRY_COMPARE_WITH_TIMEOUT(responses.size(), 1, 5'000);
+            const auto choices = responses.first().at(1).toJsonObject().value(QStringLiteral("colorQualities")).toArray();
+            QCOMPARE(choices.size(), 4);
+            for (const auto &entry : choices) {
+                const auto choice = entry.toObject();
+                const auto expected = supported && choice.value(QStringLiteral("value")).toString().endsWith(QStringLiteral("420"));
+                QCOMPARE(choice.value(QStringLiteral("disabled")).toBool(), !expected);
+            }
+            QCOMPARE(callerCapabilities.value(QStringLiteral("nativeHdrSupported")).toBool(), !supported);
+        }
+        QVERIFY(failures.isEmpty());
         client.stop();
     }
 

@@ -23,8 +23,7 @@ use crate::video_queue::VideoQueue;
 use crate::linux_backend::{LinuxVideoPath, LinuxVideoSelection};
 
 const VIDEO_QUEUE_CAPACITY: usize = 2;
-#[cfg(target_os = "macos")]
-const MAC_VIDEO_QUEUE_MAX_CAPACITY: usize = 60;
+const VIDEO_QUEUE_MAX_CAPACITY: usize = 60;
 // Ten 20 ms Opus packets cover the official client's 200 ms adaptive ceiling.
 // The queue remains bounded and drop-oldest, so recovery cannot grow latency
 // without limit under a stalled decoder.
@@ -112,16 +111,11 @@ impl RecordingTap {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn macos_video_queue_capacity(fps: u32) -> usize {
-    // FEC/NACK intentionally holds an incomplete block for up to 150 ms. Once repaired, several
-    // encoded frames can be released together, so keep 250 ms of compressed video to absorb that
-    // bounded recovery burst plus AppKit scheduling jitter. Decoded IOSurfaces remain in the small
-    // VideoToolbox/Metal queues and never pass through this buffer.
+fn video_queue_capacity(fps: u32) -> usize {
     let frames_for_recovery_burst = fps.max(1).div_ceil(4);
     usize::try_from(frames_for_recovery_burst)
-        .unwrap_or(MAC_VIDEO_QUEUE_MAX_CAPACITY)
-        .clamp(VIDEO_QUEUE_CAPACITY, MAC_VIDEO_QUEUE_MAX_CAPACITY)
+        .unwrap_or(VIDEO_QUEUE_MAX_CAPACITY)
+        .clamp(VIDEO_QUEUE_CAPACITY, VIDEO_QUEUE_MAX_CAPACITY)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,12 +245,13 @@ pub struct StreamShortcutBindings {
 
 impl StreamShortcutBindings {
     pub fn from_json(value: &serde_json::Value) -> Self {
-        let read = |key: &str, fallback: &str| {
-            value
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .and_then(ShortcutChord::parse)
-                .or_else(|| ShortcutChord::parse(fallback))
+        let read = |key: &str, fallback: &str| match value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("") => None,
+            Some(chord) => ShortcutChord::parse(chord).or_else(|| ShortcutChord::parse(fallback)),
+            None => ShortcutChord::parse(fallback),
         };
         Self {
             bindings: [
@@ -325,6 +320,15 @@ pub enum MediaColorQuality {
 }
 
 impl MediaColorQuality {
+    pub const fn protocol_name(self) -> &'static str {
+        match self {
+            Self::EightBit420 => "8bit_420",
+            Self::EightBit444 => "8bit_444",
+            Self::TenBit420 => "10bit_420",
+            Self::TenBit444 => "10bit_444",
+        }
+    }
+
     pub const fn bit_depth(self) -> u8 {
         match self {
             Self::EightBit420 | Self::EightBit444 => 8,
@@ -344,6 +348,20 @@ impl MediaColorQuality {
             Self::EightBit444 => PixelFormat::Nv24,
             Self::TenBit420 => PixelFormat::P010,
             Self::TenBit444 => PixelFormat::P410,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) const fn from_linux_pixel_format(
+        format: opennow_streamer_platform_linux::PixelFormat,
+    ) -> Option<Self> {
+        use opennow_streamer_platform_linux::PixelFormat;
+        match format {
+            PixelFormat::Nv12 | PixelFormat::I420 => Some(Self::EightBit420),
+            PixelFormat::Nv24 => Some(Self::EightBit444),
+            PixelFormat::P010 => Some(Self::TenBit420),
+            PixelFormat::P410 => Some(Self::TenBit444),
+            PixelFormat::Bgra8 | PixelFormat::Rgba8 => None,
         }
     }
 
@@ -444,6 +462,7 @@ pub struct EncodedFrame {
     pub clock_rate_hz: u32,
     pub keyframe: bool,
     pub contiguous: bool,
+    pub ssrc: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -645,6 +664,32 @@ impl CapturedInputQueue {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeStageTimings {
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub max_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeTimingsReport {
+    pub call: Option<DecodeStageTimings>,
+    pub residence: Option<DecodeStageTimings>,
+    pub call_window_samples: usize,
+    pub residence_window_samples: usize,
+    pub submissions_total: u64,
+    pub outputs_total: u64,
+    pub output_calls_total: u64,
+    pub last_submission_at: Option<Instant>,
+    pub last_output_at: Option<Instant>,
+    pub in_flight: usize,
+    pub oldest_in_flight_at: Option<Instant>,
+    pub epoch: u64,
+    pub epoch_started_at: Option<Instant>,
+    pub unmatched_outputs: u64,
+    pub unmatched_submissions: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaFeedback {
     VideoFrameAccepted {
@@ -661,6 +706,10 @@ pub enum MediaFeedback {
         to: &'static str,
         reason: String,
     },
+    ColorFormatChanged {
+        requested: MediaColorQuality,
+        actual: MediaColorQuality,
+    },
     RequestKeyframe {
         mid: String,
         reason: String,
@@ -668,6 +717,15 @@ pub enum MediaFeedback {
     DecoderError {
         codec: &'static str,
         message: String,
+    },
+    AudioDecoderError {
+        message: String,
+        consecutive: u32,
+    },
+    AudioUnavailable {
+        backend: &'static str,
+        reason: String,
+        rejected: u64,
     },
     QueueDropped {
         media: &'static str,
@@ -681,6 +739,7 @@ pub enum MediaFeedback {
         recovered: bool,
         message: Option<String>,
     },
+    DecodeTimings(DecodeTimingsReport),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -878,7 +937,7 @@ impl MediaSession {
         let video_decoder = (!use_windows_backend).then(H264Decoder::new).transpose()?;
         let audio_decoder = OpusDecoder::new(2)?;
         let shared = Arc::new(SharedPipeline {
-            video: Arc::new(VideoQueue::new(VIDEO_QUEUE_CAPACITY)),
+            video: Arc::new(VideoQueue::new(video_queue_capacity(stream.fps))),
             audio: Arc::new(BoundedQueue::new(AUDIO_QUEUE_CAPACITY)),
             output,
             feedback,
@@ -955,7 +1014,7 @@ impl MediaSession {
         let shared = Arc::new(SharedPipeline {
             // Keep a bounded scheduler-burst reserve. The VideoToolbox worker drains this queue
             // asynchronously; decoded frames remain latest-first at the Metal presentation edge.
-            video: Arc::new(VideoQueue::new(macos_video_queue_capacity(stream.fps))),
+            video: Arc::new(VideoQueue::new(video_queue_capacity(stream.fps))),
             audio: Arc::new(BoundedQueue::new(AUDIO_QUEUE_CAPACITY)),
             output,
             feedback,
@@ -1037,7 +1096,7 @@ impl MediaSession {
         let session = opennow_streamer_platform_linux::LinuxSession::start(config)
             .map_err(|error| error.to_string())?;
         let shared = Arc::new(SharedPipeline {
-            video: Arc::new(VideoQueue::new(VIDEO_QUEUE_CAPACITY)),
+            video: Arc::new(VideoQueue::new(video_queue_capacity(stream.fps))),
             audio: Arc::new(BoundedQueue::new(AUDIO_QUEUE_CAPACITY)),
             output,
             feedback,
@@ -1165,6 +1224,13 @@ impl MediaSession {
                 "embedded Linux output requires a native NV12 decoder".to_owned()
             }));
         };
+        if decoder_preference == opennow_streamer_platform_linux::DecoderPreference::SoftwareOnly
+            && (stream.hdr || stream.color_quality != crate::MediaColorQuality::EightBit420)
+        {
+            return Err(
+                "Software decoding presents 8-bit 4:2:0 SDR only. Select 8-bit 4:2:0, or disable HDR, or select a hardware backend.".to_owned(),
+            );
+        }
         let format = opennow_streamer_platform_linux::StreamFormat::video_default(
             stream.width,
             stream.height,
@@ -1226,7 +1292,7 @@ impl MediaSession {
         let session = opennow_streamer_platform_linux::LinuxSession::start(config)
             .map_err(|error| error.to_string())?;
         let shared = Arc::new(SharedPipeline {
-            video: Arc::new(VideoQueue::new(VIDEO_QUEUE_CAPACITY)),
+            video: Arc::new(VideoQueue::new(video_queue_capacity(stream.fps))),
             audio: Arc::new(BoundedQueue::new(AUDIO_QUEUE_CAPACITY)),
             output,
             feedback,
@@ -1265,10 +1331,12 @@ impl MediaSession {
         let producer = crate::LinuxGpuFrameProducer::new(8).map_err(|error| error.to_string())?;
         let embedded_frames = frames.clone();
         let monitor_shared = Arc::clone(&shared);
+        let monitor_label = linux_embedded_backend_label(decoder_preference);
         let linux_monitor = match thread::Builder::new()
             .name("opennow-embedded-linux-frame-publisher".to_owned())
-            .spawn(move || run_embedded_linux_monitor(monitor_shared, frames, producer))
-        {
+            .spawn(move || {
+                run_embedded_linux_monitor(monitor_shared, frames, producer, monitor_label)
+            }) {
             Ok(worker) => worker,
             Err(error) => {
                 shared.video.close();
@@ -1311,7 +1379,7 @@ impl MediaSession {
             );
         }
         let shared = Arc::new(SharedPipeline {
-            video: Arc::new(VideoQueue::new(macos_video_queue_capacity(stream.fps))),
+            video: Arc::new(VideoQueue::new(video_queue_capacity(stream.fps))),
             audio: Arc::new(BoundedQueue::new(AUDIO_QUEUE_CAPACITY)),
             output,
             feedback,
@@ -1506,7 +1574,7 @@ impl MediaSession {
     ) -> Result<Self, String> {
         let bridge = Arc::new(WindowsBridge::new());
         let shared = Arc::new(SharedPipeline {
-            video: Arc::new(VideoQueue::new(VIDEO_QUEUE_CAPACITY)),
+            video: Arc::new(VideoQueue::new(video_queue_capacity(stream.fps))),
             audio: Arc::new(BoundedQueue::new(AUDIO_QUEUE_CAPACITY)),
             output,
             feedback,
@@ -1625,7 +1693,7 @@ impl MediaSession {
                         eprintln!(
                             "Embedded D3D11 compressed queue overflow: dropped={} recoveryKeyframeRetained={}",
                             submission.dropped,
-                            submission.queued && frame.keyframe,
+                            (submission.queued && frame.keyframe) || submission.preserved_keyframe,
                         );
                         let _ = video_shared.feedback.send(MediaFeedback::QueueDropped {
                             media: "d3d11-video",
@@ -1633,12 +1701,30 @@ impl MediaSession {
                         });
                     }
                     if !submission.queued {
-                        invalidate_embedded_video(
-                            &video_shared,
-                            &frame.mid,
-                            "embedded D3D11 compressed-video queue overflow",
-                        );
+                        // One request per gap. Repeating this for every delta
+                        // clears `request_pending` and asks the sender for a
+                        // new IDR faster than the decoder can consume the last
+                        // one, which is what freezes the picture.
+                        if !video_shared
+                            .keyframe_requested
+                            .swap(true, Ordering::AcqRel)
+                        {
+                            invalidate_embedded_video(
+                                &video_shared,
+                                &frame.mid,
+                                if submission.preserved_keyframe {
+                                    "embedded D3D11 compressed queue retained its keyframe under backpressure"
+                                } else {
+                                    "embedded D3D11 compressed-video queue overflow"
+                                },
+                            );
+                        }
                         continue;
+                    }
+                    if frame.keyframe {
+                        video_shared
+                            .keyframe_requested
+                            .store(false, Ordering::Release);
                     }
                     report_video_frame_accepted(&video_shared, &frame);
                     if submission.needs_graphics {
@@ -1686,7 +1772,7 @@ impl MediaSession {
         #[cfg(target_os = "linux")] linux_software_fallback: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         let shared = Arc::new(SharedPipeline {
-            video: Arc::new(VideoQueue::new(VIDEO_QUEUE_CAPACITY)),
+            video: Arc::new(VideoQueue::new(video_queue_capacity(stream.fps))),
             audio: Arc::new(BoundedQueue::new(AUDIO_QUEUE_CAPACITY)),
             output,
             feedback,
@@ -1844,6 +1930,7 @@ struct EmbeddedD3d11State {
     frame_ready: Arc<dyn Fn() + Send + Sync>,
     keyframe_required: bool,
     first_frame_recorded: bool,
+    reported_pixel_format: Option<opennow_streamer_platform_windows::VideoPixelFormat>,
 }
 
 #[cfg(target_os = "windows")]
@@ -1858,6 +1945,9 @@ struct EmbeddedD3d11SubmissionOutcome {
     queued: bool,
     dropped: usize,
     needs_graphics: bool,
+    /// The decoder queue already holds a keyframe, so this delta was dropped
+    /// without erasing that recovery point.
+    preserved_keyframe: bool,
 }
 
 #[cfg(target_os = "windows")]
@@ -1917,6 +2007,7 @@ impl EmbeddedD3d11State {
             frame_ready: Arc::new(|| {}),
             keyframe_required: false,
             first_frame_recorded: false,
+            reported_pixel_format: None,
         }
     }
 
@@ -1941,7 +2032,8 @@ impl EmbeddedD3d11State {
         &mut self,
         context: crate::GraphicsContext,
         command: crate::GraphicsRecordCommand,
-    ) -> Result<crate::GraphicsRecordedFrame, crate::GraphicsFrameError> {
+    ) -> Result<(crate::GraphicsRecordedFrame, Option<MediaFeedback>), crate::GraphicsFrameError>
+    {
         use opennow_streamer_platform_windows::{
             AdoptedD3d11Context, D3d11FrameProducer, WindowsDecoderMode,
         };
@@ -2003,6 +2095,7 @@ impl EmbeddedD3d11State {
             .acquire_latest()
             .map_err(|error| error.to_string())?
             .ok_or(crate::GraphicsFrameError::NotReady)?;
+        let actual_format = frame.format();
         let recorded = unsafe {
             frame.record(
                 AdoptedD3d11Context {
@@ -2013,24 +2106,43 @@ impl EmbeddedD3d11State {
             )
         }
         .map_err(|error| error.to_string())?;
-        Ok(crate::GraphicsRecordedFrame {
-            resource: recorded.texture as usize as u64,
-            resource_view: 0,
-            color_space: recorded.color_space.into(),
-            texture_format: match recorded.texture_format {
-                opennow_streamer_platform_windows::D3d11TextureFormat::Rgba8 => {
-                    crate::GraphicsTextureFormat::Rgba8
-                }
-                opennow_streamer_platform_windows::D3d11TextureFormat::Rgb10A2 => {
-                    crate::GraphicsTextureFormat::Rgb10A2
-                }
+        let color_change = if self.reported_pixel_format != Some(actual_format.pixel_format) {
+            use opennow_streamer_platform_windows::VideoPixelFormat;
+            let quality = |format| match format {
+                VideoPixelFormat::Nv12 => MediaColorQuality::EightBit420,
+                VideoPixelFormat::P010 => MediaColorQuality::TenBit420,
+                VideoPixelFormat::Ayuv => MediaColorQuality::EightBit444,
+                VideoPixelFormat::Y410 => MediaColorQuality::TenBit444,
+            };
+            self.reported_pixel_format = Some(actual_format.pixel_format);
+            Some(MediaFeedback::ColorFormatChanged {
+                requested: quality(self.format.pixel_format),
+                actual: quality(actual_format.pixel_format),
+            })
+        } else {
+            None
+        };
+        Ok((
+            crate::GraphicsRecordedFrame {
+                resource: recorded.texture as usize as u64,
+                resource_view: 0,
+                color_space: recorded.color_space.into(),
+                texture_format: match recorded.texture_format {
+                    opennow_streamer_platform_windows::D3d11TextureFormat::Rgba8 => {
+                        crate::GraphicsTextureFormat::Rgba8
+                    }
+                    opennow_streamer_platform_windows::D3d11TextureFormat::Rgb10A2 => {
+                        crate::GraphicsTextureFormat::Rgb10A2
+                    }
+                },
+                width: recorded.width,
+                height: recorded.height,
+                frame_slot: recorded.frame_slot,
+                generation: recorded.generation,
+                presentation_time_ns: recorded.presentation_time_ns,
             },
-            width: recorded.width,
-            height: recorded.height,
-            frame_slot: recorded.frame_slot,
-            generation: recorded.generation,
-            presentation_time_ns: recorded.presentation_time_ns,
-        })
+            color_change,
+        ))
     }
 }
 
@@ -2075,6 +2187,15 @@ impl EmbeddedD3d11Submission {
                             queued: true,
                             dropped: 0,
                             needs_graphics: false,
+                            preserved_keyframe: false,
+                        }
+                    }
+                    opennow_streamer_platform_windows::PushOutcome::Backpressured => {
+                        EmbeddedD3d11SubmissionOutcome {
+                            queued: false,
+                            dropped: 1,
+                            needs_graphics: false,
+                            preserved_keyframe: true,
                         }
                     }
                     opennow_streamer_platform_windows::PushOutcome::DroppedOldest => {
@@ -2084,30 +2205,57 @@ impl EmbeddedD3d11Submission {
                                 opennow_streamer_platform_windows::ADAPTIVE_VIDEO_QUEUE_CAPACITY
                                     + usize::from(!key_frame),
                             needs_graphics: false,
+                            preserved_keyframe: false,
                         }
                     }
                 })
                 .map_err(|error| error.to_string());
         }
-        if self.pending.len() == opennow_streamer_platform_windows::ADAPTIVE_VIDEO_QUEUE_CAPACITY {
-            let key_frame = frame.key_frame;
-            let dropped = self.pending.len().saturating_add(usize::from(!key_frame));
-            self.pending.clear();
-            if key_frame {
+        let has_keyframe = self.pending.iter().any(|queued| queued.key_frame);
+        let key_frame = frame.key_frame;
+        match opennow_streamer_platform_windows::admit_compressed_frame(
+            self.pending.len(),
+            opennow_streamer_platform_windows::ADAPTIVE_VIDEO_QUEUE_CAPACITY,
+            key_frame,
+            has_keyframe,
+        ) {
+            opennow_streamer_platform_windows::CompressedAdmit::Append => {
                 self.pending.push_back(frame);
+                Ok(EmbeddedD3d11SubmissionOutcome {
+                    queued: true,
+                    dropped: 0,
+                    needs_graphics: true,
+                    preserved_keyframe: false,
+                })
             }
-            return Ok(EmbeddedD3d11SubmissionOutcome {
-                queued: key_frame,
-                dropped,
-                needs_graphics: true,
-            });
+            opennow_streamer_platform_windows::CompressedAdmit::ReplaceWithKeyframe { dropped } => {
+                self.pending.clear();
+                self.pending.push_back(frame);
+                Ok(EmbeddedD3d11SubmissionOutcome {
+                    queued: true,
+                    dropped,
+                    needs_graphics: true,
+                    preserved_keyframe: false,
+                })
+            }
+            opennow_streamer_platform_windows::CompressedAdmit::PreserveQueuedKeyframe => {
+                Ok(EmbeddedD3d11SubmissionOutcome {
+                    queued: false,
+                    dropped: 1,
+                    needs_graphics: true,
+                    preserved_keyframe: true,
+                })
+            }
+            opennow_streamer_platform_windows::CompressedAdmit::DiscardChain { dropped } => {
+                self.pending.clear();
+                Ok(EmbeddedD3d11SubmissionOutcome {
+                    queued: false,
+                    dropped,
+                    needs_graphics: true,
+                    preserved_keyframe: false,
+                })
+            }
         }
-        self.pending.push_back(frame);
-        Ok(EmbeddedD3d11SubmissionOutcome {
-            queued: true,
-            dropped: 0,
-            needs_graphics: true,
-        })
     }
 
     fn reset(&mut self) {
@@ -2121,7 +2269,14 @@ impl EmbeddedD3d11Submission {
             let outcome = submitter
                 .submit_video(frame)
                 .map_err(|error| error.to_string())?;
-            if outcome == opennow_streamer_platform_windows::PushOutcome::DroppedOldest {
+            if matches!(
+                outcome,
+                opennow_streamer_platform_windows::PushOutcome::DroppedOldest
+                    | opennow_streamer_platform_windows::PushOutcome::Backpressured
+            ) {
+                // The decoder queue rejected this access unit. Later pending
+                // deltas reference it, so they must not follow a preserved or
+                // discarded chain.
                 dropped = dropped
                     .max(opennow_streamer_platform_windows::ADAPTIVE_VIDEO_QUEUE_CAPACITY + 1);
                 self.pending.clear();
@@ -2235,7 +2390,11 @@ impl crate::GraphicsFrame for PendingD3d11Frame {
         command: crate::GraphicsRecordCommand,
     ) -> Result<crate::GraphicsRecordedFrame, crate::GraphicsFrameError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let result = state.record(context, command);
+        let mut color_change = None;
+        let result = state.record(context, command).map(|(frame, change)| {
+            color_change = change;
+            frame
+        });
         let first_frame = state.take_first_recorded_frame(result.is_ok());
         let keyframe_required = state.take_keyframe_required();
         drop(state);
@@ -2243,6 +2402,9 @@ impl crate::GraphicsFrame for PendingD3d11Frame {
             let _ = self.shared.feedback.send(MediaFeedback::PlaybackStarted {
                 backend: "D3D11/Qt",
             });
+        }
+        if let Some(change) = color_change {
+            let _ = self.shared.feedback.send(change);
         }
         if keyframe_required {
             invalidate_embedded_video(
@@ -2375,6 +2537,19 @@ fn run_windows_video(shared: Arc<SharedPipeline>, maximum_fps: u32) {
                 }
             }
             Ok(WindowsPushOutcome::Paused) => {}
+            Ok(WindowsPushOutcome::Backpressured) => {
+                let _ = shared.feedback.send(MediaFeedback::QueueDropped {
+                    media: "d3d11-video",
+                    count: 1,
+                });
+                shared.video_desynced.store(true, Ordering::Release);
+                shared.windows_bridge.require_keyframe();
+                request_keyframe(
+                    &shared,
+                    &frame.mid,
+                    "D3D11 input queue kept its keyframe under backpressure",
+                );
+            }
             Ok(WindowsPushOutcome::DroppedOldest) => {
                 let _ = shared.feedback.send(MediaFeedback::QueueDropped {
                     media: "d3d11-video",
@@ -2471,8 +2646,11 @@ fn media_timestamp_100ns(timestamp: u64, clock_rate_hz: u32) -> i64 {
 #[cfg(target_os = "windows")]
 fn invalidate_embedded_video(shared: &SharedPipeline, mid: &str, reason: &str) {
     // Invalidate queued AND already-dequeued access units. An older keyframe
-    // submission must never clear a newer decoder/transport failure.
+    // submission must never clear a newer decoder/transport failure. The hold
+    // keeps the following deltas from each requesting another IDR; `clear`
+    // alone re-arms that request.
     shared.video.clear();
+    shared.video.hold_keyframe_request();
     opennow_streamer_protocol::log::log_async("WARN", "video-reference", reason);
     let _ = shared.feedback.send(MediaFeedback::RequestKeyframe {
         mid: mid.to_owned(),
@@ -2496,9 +2674,14 @@ impl Drop for MediaSession {
     }
 }
 
+#[cfg(test)]
+type TestVideoDecode = Box<dyn FnMut(&[u8]) -> Result<Option<DecodedVideoFrame>, String> + Send>;
+
 struct H264Decoder {
     decoder: OpenH264Decoder,
     parameter_sets: crate::h264::H264ParameterSets,
+    #[cfg(test)]
+    decode_for_test: Option<TestVideoDecode>,
 }
 
 impl H264Decoder {
@@ -2510,6 +2693,8 @@ impl H264Decoder {
         .map(|decoder| Self {
             decoder,
             parameter_sets: crate::h264::H264ParameterSets::default(),
+            #[cfg(test)]
+            decode_for_test: None,
         })
         .map_err(|error| format!("OpenH264 decoder initialization failed: {error}"))
     }
@@ -2528,6 +2713,10 @@ impl H264Decoder {
     }
 
     fn decode(&mut self, encoded: &[u8]) -> Result<Option<DecodedVideoFrame>, String> {
+        #[cfg(test)]
+        if let Some(decode) = self.decode_for_test.as_mut() {
+            return decode(encoded);
+        }
         let yuv = self
             .decoder
             .decode(encoded)
@@ -2630,14 +2819,17 @@ fn run_video_decoder_from(
                         codec: "h264",
                         message,
                     });
+                    request_software_keyframe(&shared, &frame.mid);
                     continue;
                 }
             }
-            shared.video_desynced.store(false, Ordering::Release);
-            shared.keyframe_requested.store(false, Ordering::Release);
         }
         match decoder.decode(&frame.data) {
             Ok(Some(decoded)) => {
+                if frame.keyframe {
+                    shared.video_desynced.store(false, Ordering::Release);
+                }
+                shared.keyframe_requested.store(false, Ordering::Release);
                 report_video_frame_accepted(&shared, &frame);
                 if shared.output.replace_video(decoded) {
                     let _ = shared.feedback.send(MediaFeedback::QueueDropped {
@@ -2646,21 +2838,29 @@ fn run_video_decoder_from(
                     });
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if frame.keyframe {
+                    shared.video_desynced.store(false, Ordering::Release);
+                }
+            }
             Err(message) => {
                 let _ = shared.feedback.send(MediaFeedback::DecoderError {
                     codec: "h264",
                     message,
                 });
                 shared.video_desynced.store(true, Ordering::Release);
-                if !shared.keyframe_requested.swap(true, Ordering::AcqRel) {
-                    let _ = shared.feedback.send(MediaFeedback::RequestKeyframe {
-                        mid: frame.mid,
-                        reason: "H.264 decoder rejected an access unit".to_owned(),
-                    });
-                }
+                request_software_keyframe(&shared, &frame.mid);
             }
         }
+    }
+}
+
+fn request_software_keyframe(shared: &SharedPipeline, mid: &str) {
+    if !shared.keyframe_requested.swap(true, Ordering::AcqRel) {
+        let _ = shared.feedback.send(MediaFeedback::RequestKeyframe {
+            mid: mid.to_owned(),
+            reason: "H.264 decoder rejected an access unit".to_owned(),
+        });
     }
 }
 
@@ -2752,7 +2952,11 @@ fn submit_decoded_audio(shared: &SharedPipeline, samples: Vec<f32>, channels: u8
                     count: 1,
                 });
             }
-            Ok(WindowsPushOutcome::Queued | WindowsPushOutcome::Paused) => {}
+            Ok(
+                WindowsPushOutcome::Queued
+                | WindowsPushOutcome::Paused
+                | WindowsPushOutcome::Backpressured,
+            ) => {}
             Err(error) => {
                 let _ = shared.feedback.send(MediaFeedback::DecoderError {
                     codec: "opus",
@@ -2837,6 +3041,9 @@ fn run_linux_video(shared: Arc<SharedPipeline>, host_commands: Sender<HostComman
                 }
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+            Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {
+                unreachable!("audio-disabled outcomes are not produced by video submission")
+            }
             Err(reason) => trigger_linux_fallback(
                 &shared,
                 &host_commands,
@@ -2895,6 +3102,9 @@ fn run_embedded_linux_video(shared: Arc<SharedPipeline>) {
                 request_linux_keyframe(&shared, "embedded Linux decoder queue overflow");
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+            Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {
+                unreachable!("audio-disabled outcomes are not produced by video submission")
+            }
             Err(message) => {
                 let _ = shared.feedback.send(MediaFeedback::DecoderError {
                     codec: shared.linux_codec.label(),
@@ -2915,9 +3125,27 @@ fn run_embedded_linux_audio(shared: Arc<SharedPipeline>) {
         let MediaCodec::Opus { .. } = frame.codec else {
             continue;
         };
+        let Some(ssrc) = frame.ssrc else {
+            let _ = shared.feedback.send(MediaFeedback::DecoderError {
+                codec: "opus",
+                message: "embedded Linux audio frame carries no sender source identifier"
+                    .to_owned(),
+            });
+            continue;
+        };
+        let Ok(rtp_timestamp) = u32::try_from(frame.timestamp) else {
+            let _ = shared.feedback.send(MediaFeedback::DecoderError {
+                codec: "opus",
+                message: "embedded Linux audio frame carries an out-of-range RTP timestamp"
+                    .to_owned(),
+            });
+            continue;
+        };
         let packet = match opennow_streamer_platform_linux::AudioPacket::new(
             Arc::clone(&frame.data),
-            media_timestamp_us(frame.timestamp, frame.clock_rate_hz),
+            rtp_timestamp,
+            frame.clock_rate_hz,
+            ssrc,
         ) {
             Ok(packet) => packet,
             Err(error) => {
@@ -2947,7 +3175,8 @@ fn run_embedded_linux_audio(shared: Arc<SharedPipeline>) {
                 });
             }
             Ok(opennow_streamer_platform_linux::PushOutcome::Queued)
-            | Ok(opennow_streamer_platform_linux::PushOutcome::Paused) => {}
+            | Ok(opennow_streamer_platform_linux::PushOutcome::Paused)
+            | Ok(opennow_streamer_platform_linux::PushOutcome::AudioDisabled) => {}
             Err(message) => {
                 let _ = shared.feedback.send(MediaFeedback::DecoderError {
                     codec: "opus",
@@ -2963,12 +3192,16 @@ fn run_embedded_linux_monitor(
     shared: Arc<SharedPipeline>,
     publisher: crate::GraphicsFramePublisher,
     producer: crate::LinuxGpuFrameProducer,
+    backend_label: &'static str,
 ) {
     use std::time::Duration;
 
     let mut playback_started = false;
+    let mut last_decode_timings_report = Instant::now();
+    let mut reported_color = None;
     while !shared.stopped.load(Ordering::Acquire) {
-        let (frames, events) = {
+        let report_decode_timings = last_decode_timings_report.elapsed() >= Duration::from_secs(1);
+        let (frame, events, decode_timings) = {
             let session = shared
                 .linux_session
                 .lock()
@@ -2976,38 +3209,72 @@ fn run_embedded_linux_monitor(
             let Some(session) = session.as_ref() else {
                 return;
             };
-            let mut decoded = Vec::new();
-            while let Some(frame) = session.try_recv_frame() {
-                decoded.push(frame);
-            }
+            let frame = session.try_recv_latest_frame();
             let mut events = Vec::new();
             while let Some(event) = session.try_recv_event() {
                 events.push(event);
             }
-            (decoded, events)
+            let decode_timings = report_decode_timings.then(|| session.decode_timings());
+            (frame, events, decode_timings)
         };
-        if !shared.paused.load(Ordering::Acquire) {
-            for decoded in frames {
-                let Some(lease) = publisher.context() else {
-                    continue;
-                };
-                match producer
-                    .frame(decoded)
-                    .map_err(|error| error.to_string())
-                    .and_then(|frame| {
-                        publisher
-                            .publish(lease, Arc::new(frame))
-                            .map_err(|error| error.to_string())
-                    }) {
-                    Ok(_) if !playback_started => {
-                        playback_started = true;
-                        let _ = shared.feedback.send(MediaFeedback::PlaybackStarted {
-                            backend: "Linux decoder/embedded Vulkan",
-                        });
+        if let Some(timings) = decode_timings {
+            last_decode_timings_report = Instant::now();
+            if timings.has_observable_state() {
+                let stage = |stage: opennow_streamer_platform_linux::DecodeStagePercentiles| {
+                    DecodeStageTimings {
+                        p50_us: stage.p50_us,
+                        p95_us: stage.p95_us,
+                        max_us: stage.max_us,
                     }
-                    Ok(_) => {}
-                    Err(message) => {
-                        let _ = shared.feedback.send(MediaFeedback::OutputError { message });
+                };
+                let _ = shared
+                    .feedback
+                    .send(MediaFeedback::DecodeTimings(DecodeTimingsReport {
+                        call: timings.call.map(stage),
+                        residence: timings.residence.map(stage),
+                        call_window_samples: timings.call_window_samples,
+                        residence_window_samples: timings.residence_window_samples,
+                        submissions_total: timings.submissions_total,
+                        outputs_total: timings.outputs_total,
+                        output_calls_total: timings.output_calls_total,
+                        last_submission_at: timings.last_submission_at,
+                        last_output_at: timings.last_output_at,
+                        in_flight: timings.in_flight,
+                        oldest_in_flight_at: timings.oldest_in_flight_at,
+                        epoch: timings.epoch,
+                        epoch_started_at: timings.epoch_started_at,
+                        unmatched_outputs: timings.unmatched_outputs,
+                        unmatched_submissions: timings.unmatched_submissions,
+                    }));
+            }
+        }
+        if !shared.paused.load(Ordering::Acquire) {
+            if let Some((decoded, skipped)) = frame {
+                if skipped > 0 {
+                    let _ = shared.feedback.send(MediaFeedback::QueueDropped {
+                        media: "decoded-video",
+                        count: skipped,
+                    });
+                }
+                if let Some(lease) = publisher.context() {
+                    match producer
+                        .frame(decoded)
+                        .map_err(|error| error.to_string())
+                        .and_then(|frame| {
+                            publisher
+                                .publish(lease, Arc::new(frame))
+                                .map_err(|error| error.to_string())
+                        }) {
+                        Ok(_) if !playback_started => {
+                            playback_started = true;
+                            let _ = shared.feedback.send(MediaFeedback::PlaybackStarted {
+                                backend: backend_label,
+                            });
+                        }
+                        Ok(_) => {}
+                        Err(message) => {
+                            let _ = shared.feedback.send(MediaFeedback::OutputError { message });
+                        }
                     }
                 }
             }
@@ -3065,10 +3332,40 @@ fn run_embedded_linux_monitor(
                     stop_linux_session(&shared);
                     return;
                 }
+                opennow_streamer_platform_linux::BackendEvent::AudioDecodeError {
+                    message,
+                    consecutive,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioDecoderError {
+                        message,
+                        consecutive,
+                    });
+                }
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputError {
+                    backend,
+                    message,
+                } => forward_linux_audio_output_loss(&shared, backend, message),
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputRecovered {
+                    from,
+                    to,
+                } => forward_linux_audio_output_recovery(&shared, from, to),
+                opennow_streamer_platform_linux::BackendEvent::AudioUnavailable {
+                    backend,
+                    reason,
+                    rejected,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioUnavailable {
+                        backend: linux_audio_backend_name(backend),
+                        reason,
+                        rejected,
+                    });
+                }
+                opennow_streamer_platform_linux::BackendEvent::FormatChanged(format) => {
+                    report_linux_color_format_change(&shared, &mut reported_color, format);
+                }
                 opennow_streamer_platform_linux::BackendEvent::StateChanged(_)
                 | opennow_streamer_platform_linux::BackendEvent::DecoderSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::FormatChanged(_) => {}
+                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_) => {}
             }
         }
         thread::sleep(Duration::from_millis(2));
@@ -3080,6 +3377,7 @@ fn run_embedded_linux_monitor(
 fn run_linux_monitor(shared: Arc<SharedPipeline>, host_commands: Sender<HostCommand>) {
     use std::time::Duration;
 
+    let mut reported_color = None;
     while !shared.stopped.load(Ordering::Acquire) {
         if shared.linux_software_fallback.load(Ordering::Acquire) {
             request_linux_keyframe(&shared, "Linux decoder fallback requires a fresh keyframe");
@@ -3157,10 +3455,40 @@ fn run_linux_monitor(shared: Arc<SharedPipeline>, host_commands: Sender<HostComm
                     &host_commands,
                     "Linux hardware media session failed".to_owned(),
                 ),
+                opennow_streamer_platform_linux::BackendEvent::AudioDecodeError {
+                    message,
+                    consecutive,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioDecoderError {
+                        message,
+                        consecutive,
+                    });
+                }
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputError {
+                    backend,
+                    message,
+                } => forward_linux_audio_output_loss(&shared, backend, message),
+                opennow_streamer_platform_linux::BackendEvent::AudioOutputRecovered {
+                    from,
+                    to,
+                } => forward_linux_audio_output_recovery(&shared, from, to),
+                opennow_streamer_platform_linux::BackendEvent::AudioUnavailable {
+                    backend,
+                    reason,
+                    rejected,
+                } => {
+                    let _ = shared.feedback.send(MediaFeedback::AudioUnavailable {
+                        backend: linux_audio_backend_name(backend),
+                        reason,
+                        rejected,
+                    });
+                }
+                opennow_streamer_platform_linux::BackendEvent::FormatChanged(format) => {
+                    report_linux_color_format_change(&shared, &mut reported_color, format);
+                }
                 opennow_streamer_platform_linux::BackendEvent::StateChanged(_)
                 | opennow_streamer_platform_linux::BackendEvent::DecoderSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_)
-                | opennow_streamer_platform_linux::BackendEvent::FormatChanged(_) => {}
+                | opennow_streamer_platform_linux::BackendEvent::AudioSelected(_) => {}
             }
         }
         thread::sleep(Duration::from_millis(2));
@@ -3222,6 +3550,25 @@ fn stop_linux_session(shared: &SharedPipeline) {
 }
 
 #[cfg(target_os = "linux")]
+fn report_linux_color_format_change(
+    shared: &SharedPipeline,
+    reported: &mut Option<MediaColorQuality>,
+    format: opennow_streamer_platform_linux::StreamFormat,
+) {
+    let Some(actual) = MediaColorQuality::from_linux_pixel_format(format.pixel_format) else {
+        return;
+    };
+    if *reported == Some(actual) {
+        return;
+    }
+    *reported = Some(actual);
+    let _ = shared.feedback.send(MediaFeedback::ColorFormatChanged {
+        requested: shared.stream.color_quality,
+        actual,
+    });
+}
+
+#[cfg(target_os = "linux")]
 const fn linux_decoder_name(
     backend: opennow_streamer_platform_linux::DecoderBackend,
 ) -> &'static str {
@@ -3232,6 +3579,58 @@ const fn linux_decoder_name(
         opennow_streamer_platform_linux::DecoderBackend::V4l2 => "V4L2/Vulkan",
         opennow_streamer_platform_linux::DecoderBackend::Ffmpeg => "FFmpeg software/Vulkan",
     }
+}
+
+#[cfg(target_os = "linux")]
+const fn linux_embedded_backend_label(
+    preference: opennow_streamer_platform_linux::DecoderPreference,
+) -> &'static str {
+    match preference {
+        opennow_streamer_platform_linux::DecoderPreference::SoftwareOnly => {
+            linux_decoder_name(opennow_streamer_platform_linux::DecoderBackend::Ffmpeg)
+        }
+        _ => "Linux decoder/embedded Vulkan",
+    }
+}
+
+#[cfg(target_os = "linux")]
+const fn linux_audio_backend_name(
+    backend: opennow_streamer_platform_linux::AudioBackend,
+) -> &'static str {
+    match backend {
+        opennow_streamer_platform_linux::AudioBackend::PipeWire => "PipeWire",
+        opennow_streamer_platform_linux::AudioBackend::Alsa => "ALSA",
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn forward_linux_audio_output_loss(
+    shared: &SharedPipeline,
+    backend: opennow_streamer_platform_linux::AudioBackend,
+    message: String,
+) {
+    let _ = shared.feedback.send(MediaFeedback::DeviceLost {
+        subsystem: linux_audio_backend_name(backend),
+        recovered: false,
+        message: Some(message),
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn forward_linux_audio_output_recovery(
+    shared: &SharedPipeline,
+    from: opennow_streamer_platform_linux::AudioBackend,
+    to: opennow_streamer_platform_linux::AudioBackend,
+) {
+    let _ = shared.feedback.send(MediaFeedback::DeviceLost {
+        subsystem: linux_audio_backend_name(from),
+        recovered: true,
+        message: Some(format!(
+            "{} accepted audio output after the {} sink failed",
+            linux_audio_backend_name(to),
+            linux_audio_backend_name(from)
+        )),
+    });
 }
 
 #[cfg(target_os = "linux")]
@@ -3989,7 +4388,92 @@ mod tests {
             (MediaColorQuality::TenBit444, PixelFormat::P410),
         ] {
             assert_eq!(color.linux_pixel_format(), format);
+            assert_eq!(
+                MediaColorQuality::from_linux_pixel_format(format),
+                Some(color)
+            );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_decoded_formats_without_a_color_class_are_not_guessed() {
+        use opennow_streamer_platform_linux::PixelFormat;
+        assert_eq!(
+            MediaColorQuality::from_linux_pixel_format(PixelFormat::I420),
+            Some(MediaColorQuality::EightBit420)
+        );
+        for format in [PixelFormat::Bgra8, PixelFormat::Rgba8] {
+            assert_eq!(MediaColorQuality::from_linux_pixel_format(format), None);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_format_change_reports_the_decoded_color_class_once_per_change() {
+        use opennow_streamer_platform_linux::{ColorTransfer, PixelFormat, StreamFormat};
+
+        let (feedback, receiver) = std::sync::mpsc::channel();
+        let stream = MediaStreamConfig {
+            codec: MediaVideoCodec::H265,
+            color_quality: MediaColorQuality::TenBit420,
+            ..MediaStreamConfig::default()
+        };
+        let shared = SharedPipeline {
+            video: Arc::new(VideoQueue::new(VIDEO_QUEUE_CAPACITY)),
+            audio: Arc::new(BoundedQueue::new(AUDIO_QUEUE_CAPACITY)),
+            output: Arc::new(OutputBuffers::new()),
+            feedback,
+            paused: AtomicBool::new(false),
+            video_desynced: AtomicBool::new(false),
+            keyframe_requested: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            recording_tap: RecordingTap::default(),
+            replay_tap: crate::replay::ReplayTap::default(),
+            stream,
+            linux_session: Mutex::new(None),
+            linux_software_fallback: Arc::new(AtomicBool::new(false)),
+            linux_video_mid: Mutex::new(String::new()),
+            linux_codec: stream.codec,
+        };
+        let format = |pixel_format| StreamFormat {
+            pixel_format,
+            color_transfer: ColorTransfer::Sdr,
+            ..StreamFormat::video_default(1920, 1080).expect("valid default format")
+        };
+
+        let mut reported = None;
+        report_linux_color_format_change(&shared, &mut reported, format(PixelFormat::Nv12));
+        assert_eq!(
+            receiver.try_recv().expect("downgrade report"),
+            MediaFeedback::ColorFormatChanged {
+                requested: MediaColorQuality::TenBit420,
+                actual: MediaColorQuality::EightBit420,
+            }
+        );
+        report_linux_color_format_change(&shared, &mut reported, format(PixelFormat::Nv12));
+        assert!(receiver.try_recv().is_err());
+
+        report_linux_color_format_change(
+            &shared,
+            &mut reported,
+            StreamFormat {
+                width: 1280,
+                height: 720,
+                ..format(PixelFormat::Nv12)
+            },
+        );
+        assert!(receiver.try_recv().is_err());
+
+        report_linux_color_format_change(&shared, &mut reported, format(PixelFormat::P010));
+        assert_eq!(
+            receiver.try_recv().expect("restored format report"),
+            MediaFeedback::ColorFormatChanged {
+                requested: MediaColorQuality::TenBit420,
+                actual: MediaColorQuality::TenBit420,
+            }
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -4022,6 +4506,21 @@ mod tests {
                 DecoderPreference::VulkanOnly,
                 "attached shared device",
             ),
+            (
+                MediaColorQuality::TenBit420,
+                DecoderPreference::SoftwareOnly,
+                "8-bit 4:2:0 SDR only",
+            ),
+            (
+                MediaColorQuality::EightBit444,
+                DecoderPreference::SoftwareOnly,
+                "8-bit 4:2:0 SDR only",
+            ),
+            (
+                MediaColorQuality::TenBit444,
+                DecoderPreference::SoftwareOnly,
+                "8-bit 4:2:0 SDR only",
+            ),
         ] {
             let (feedback, _feedback_receiver) = std::sync::mpsc::channel();
             let (commands, _command_receiver) = std::sync::mpsc::channel();
@@ -4047,6 +4546,83 @@ mod tests {
             );
             assert!(result.err().is_some_and(|error| error.contains(expected)));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn device_lost_feedback(
+        receiver: &Receiver<MediaFeedback>,
+    ) -> (&'static str, bool, Option<String>) {
+        match receiver
+            .try_recv()
+            .expect("a device state feedback for every audio output event")
+        {
+            MediaFeedback::DeviceLost {
+                subsystem,
+                recovered,
+                message,
+            } => (subsystem, recovered, message),
+            other => panic!("expected a device state feedback, saw {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_audio_output_feedback_pairs_loss_and_recovery_without_touching_video() {
+        use opennow_streamer_platform_linux::AudioBackend;
+
+        let (shared, receiver) = software_test_pipeline();
+        forward_linux_audio_output_loss(&shared, AudioBackend::PipeWire, "Broken pipe".to_owned());
+        forward_linux_audio_output_recovery(&shared, AudioBackend::PipeWire, AudioBackend::Alsa);
+
+        let loss = device_lost_feedback(&receiver);
+        assert_eq!(loss.0, "PipeWire");
+        assert!(!loss.1);
+        assert_eq!(loss.2.as_deref(), Some("Broken pipe"));
+
+        let recovery = device_lost_feedback(&receiver);
+        assert_eq!(
+            recovery.0, "PipeWire",
+            "recovery must clear the audio subsystem that lost output"
+        );
+        assert!(recovery.1);
+        assert!(
+            recovery
+                .2
+                .as_deref()
+                .is_some_and(|message| message.contains("ALSA") && message.contains("PipeWire")),
+            "recovery must name the sink that accepted output, saw {:?}",
+            recovery.2
+        );
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "one loss and one recovery only"
+        );
+        assert!(!shared.stopped.load(Ordering::Acquire));
+        assert!(!shared.keyframe_requested.load(Ordering::Acquire));
+        assert!(shared.video_desynced.load(Ordering::Acquire));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_audio_output_recovery_pairs_a_backend_that_recovered_itself() {
+        use opennow_streamer_platform_linux::AudioBackend;
+
+        let (shared, receiver) = software_test_pipeline();
+        forward_linux_audio_output_loss(&shared, AudioBackend::Alsa, "Device lost".to_owned());
+        forward_linux_audio_output_recovery(&shared, AudioBackend::Alsa, AudioBackend::Alsa);
+
+        let loss = device_lost_feedback(&receiver);
+        let recovery = device_lost_feedback(&receiver);
+        assert_eq!(loss, ("ALSA", false, Some("Device lost".to_owned())));
+        assert_eq!(
+            recovery.0, loss.0,
+            "a backend that accepted output again clears its own loss"
+        );
+        assert!(recovery.1);
+        assert!(receiver.try_recv().is_err());
+        assert!(!shared.stopped.load(Ordering::Acquire));
+        assert!(!shared.keyframe_requested.load(Ordering::Acquire));
     }
 
     #[cfg(target_os = "windows")]
@@ -4177,11 +4753,12 @@ mod tests {
         let capacity = opennow_streamer_platform_windows::ADAPTIVE_VIDEO_QUEUE_CAPACITY;
         for index in 0..capacity {
             assert_eq!(
-                state.push(embedded_h264_frame(index as i64, index == 0)),
+                state.push(embedded_h264_frame(index as i64, false)),
                 Ok(EmbeddedD3d11SubmissionOutcome {
                     queued: true,
                     dropped: 0,
                     needs_graphics: true,
+                    preserved_keyframe: false,
                 })
             );
         }
@@ -4193,6 +4770,7 @@ mod tests {
                 queued: false,
                 dropped: capacity + 1,
                 needs_graphics: true,
+                preserved_keyframe: false,
             })
         );
         assert!(state.pending.is_empty());
@@ -4203,9 +4781,35 @@ mod tests {
                 queued: true,
                 dropped: 0,
                 needs_graphics: true,
+                preserved_keyframe: false,
             })
         );
         assert_eq!(state.pending.len(), 1);
+        assert!(state.pending.front().is_some_and(|frame| frame.key_frame));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn embedded_d3d11_overflow_keeps_a_queued_keyframe() {
+        let mut state = EmbeddedD3d11Submission::new();
+        let capacity = opennow_streamer_platform_windows::ADAPTIVE_VIDEO_QUEUE_CAPACITY;
+        for index in 0..capacity {
+            assert!(
+                state
+                    .push(embedded_h264_frame(index as i64, index == 0))
+                    .is_ok_and(|outcome| outcome.queued && !outcome.preserved_keyframe)
+            );
+        }
+        assert_eq!(
+            state.push(embedded_h264_frame(capacity as i64, false)),
+            Ok(EmbeddedD3d11SubmissionOutcome {
+                queued: false,
+                dropped: 1,
+                needs_graphics: true,
+                preserved_keyframe: true,
+            })
+        );
+        assert_eq!(state.pending.len(), capacity);
         assert!(state.pending.front().is_some_and(|frame| frame.key_frame));
     }
 
@@ -4228,6 +4832,7 @@ mod tests {
                 queued: true,
                 dropped: capacity,
                 needs_graphics: true,
+                preserved_keyframe: false,
             })
         );
         assert_eq!(state.pending.len(), 1);
@@ -4279,6 +4884,20 @@ mod tests {
     }
 
     #[test]
+    fn explicitly_cleared_shortcuts_do_not_capture_gameplay_keys() {
+        let bindings = StreamShortcutBindings::from_json(&serde_json::json!({
+            "toggleStats":"", "toggleRecording":"", "saveClip":""
+        }));
+        assert_eq!(bindings.action(u16::from(b'N'), 0x02), None);
+        assert_eq!(bindings.action(0x7b, 0), None);
+        assert_eq!(bindings.action(0x7b, 0x02), None);
+        assert_eq!(
+            bindings.action(0x7a, 0),
+            Some(StreamShortcutAction::ToggleFullscreen)
+        );
+    }
+
+    #[test]
     fn replay_and_manual_recording_share_payloads_and_stop_independently() {
         let recording = RecordingTap::default();
         let receiver = recording.subscribe().unwrap();
@@ -4297,6 +4916,7 @@ mod tests {
             clock_rate_hz: 90_000,
             keyframe: true,
             contiguous: true,
+            ssrc: None,
         };
         recording.publish(&frame);
         replay.publish(&frame);
@@ -4351,6 +4971,7 @@ mod tests {
             clock_rate_hz: 90_000,
             keyframe: true,
             contiguous: true,
+            ssrc: None,
         };
         for _ in 0..=RECORDING_TAP_QUEUE_CAPACITY {
             tap.publish(&frame);
@@ -4368,10 +4989,17 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_encoded_queue_keeps_bounded_scheduler_burst_tolerance() {
-        assert_eq!(macos_video_queue_capacity(30), 8);
-        assert_eq!(macos_video_queue_capacity(60), 15);
-        assert_eq!(macos_video_queue_capacity(120), 30);
-        assert_eq!(macos_video_queue_capacity(240), 60);
+        assert_eq!(video_queue_capacity(30), 8);
+        assert_eq!(video_queue_capacity(60), 15);
+        assert_eq!(video_queue_capacity(120), 30);
+        assert_eq!(video_queue_capacity(240), 60);
+    }
+
+    #[test]
+    fn video_ingress_capacity_stays_bounded_for_invalid_and_extreme_fps() {
+        assert_eq!(video_queue_capacity(0), 2);
+        assert_eq!(video_queue_capacity(60), 15);
+        assert_eq!(video_queue_capacity(u32::MAX), 60);
     }
 
     #[test]
@@ -4523,6 +5151,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: true,
                 contiguous: true,
+                ssrc: None,
             }),
         );
         let decoded = output.take_video().expect("decoded pending frame");
@@ -4563,6 +5192,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: true,
                 contiguous: false,
+                ssrc: None,
             }),
         );
         let decoded = output.take_video().expect("recovered IDR");
@@ -4608,10 +5238,141 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: false,
+                ssrc: None,
             }),
         );
         assert!(shared.video_desynced.load(Ordering::Acquire));
         assert!(shared.output.take_video().is_none());
+        assert!(feedback.try_recv().is_err());
+    }
+
+    #[test]
+    fn software_worker_requests_once_until_a_keyframe_decodes() {
+        let rgb = vec![96_u8; 32 * 32 * 3];
+        let yuv = YUVBuffer::from_rgb_source(RgbSliceU8::new(&rgb, (32, 32)));
+        let valid_keyframe: Arc<[u8]> = Encoder::new()
+            .unwrap()
+            .encode(&yuv)
+            .unwrap()
+            .to_vec()
+            .into();
+        let (shared, feedback) = software_test_pipeline();
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || {
+            run_video_decoder(worker_shared, H264Decoder::new().unwrap());
+        });
+        let make_frame = |id, data: Arc<[u8]>| EncodedFrame {
+            mid: "video".to_owned(),
+            codec: MediaCodec::H264,
+            data,
+            frame_index: Some(id),
+            timestamp: u64::from(id) * 750,
+            clock_rate_hz: 90_000,
+            keyframe: true,
+            contiguous: true,
+            ssrc: None,
+        };
+        let malformed: Arc<[u8]> = Arc::from([0, 0, 1, 0x67, 0xff]);
+        for id in 1..=3 {
+            shared
+                .video
+                .push(make_frame(id, Arc::clone(&malformed)))
+                .unwrap();
+            assert!(matches!(
+                feedback.recv_timeout(std::time::Duration::from_secs(2)),
+                Ok(MediaFeedback::DecoderError { codec: "h264", .. })
+            ));
+            if id == 1 {
+                assert!(matches!(
+                    feedback.recv_timeout(std::time::Duration::from_secs(2)),
+                    Ok(MediaFeedback::RequestKeyframe { .. })
+                ));
+            } else {
+                assert!(feedback.try_recv().is_err());
+            }
+            assert!(shared.video_desynced.load(Ordering::Acquire));
+            assert!(shared.output.take_video().is_none());
+        }
+        shared.video.push(make_frame(4, valid_keyframe)).unwrap();
+        assert!(matches!(
+            feedback.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(MediaFeedback::VideoFrameAccepted {
+                frame_index: Some(4),
+                ..
+            })
+        ));
+        shared.video.close();
+        worker.join().unwrap();
+        assert!(!shared.video_desynced.load(Ordering::Acquire));
+        assert!(!shared.keyframe_requested.load(Ordering::Acquire));
+        assert!(shared.output.take_video().is_some());
+        assert!(feedback.try_recv().is_err());
+    }
+
+    #[test]
+    fn software_worker_accepts_a_buffered_keyframe_before_output() {
+        let (shared, feedback) = software_test_pipeline();
+        shared.keyframe_requested.store(true, Ordering::Release);
+        let mut decoder = H264Decoder::new().unwrap();
+        let decoder_shared = Arc::clone(&shared);
+        let mut has_reference = false;
+        decoder.decode_for_test = Some(Box::new(move |encoded| match encoded {
+            b"idr" => {
+                has_reference = true;
+                Ok(None)
+            }
+            b"delta" if has_reference => {
+                assert!(decoder_shared.keyframe_requested.load(Ordering::Acquire));
+                Ok(Some(DecodedVideoFrame {
+                    width: 1,
+                    height: 1,
+                    rgb: vec![96; 3],
+                }))
+            }
+            _ => Err("missing reference".to_owned()),
+        }));
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::spawn(move || run_video_decoder(worker_shared, decoder));
+        shared
+            .video
+            .push(EncodedFrame {
+                mid: "video".to_owned(),
+                codec: MediaCodec::H264,
+                data: Arc::from(&b"idr"[..]),
+                frame_index: Some(1),
+                timestamp: 750,
+                clock_rate_hz: 90_000,
+                keyframe: true,
+                contiguous: true,
+                ssrc: None,
+            })
+            .unwrap();
+        shared
+            .video
+            .push(EncodedFrame {
+                mid: "video".to_owned(),
+                codec: MediaCodec::H264,
+                data: Arc::from(&b"delta"[..]),
+                frame_index: Some(2),
+                timestamp: 1500,
+                clock_rate_hz: 90_000,
+                keyframe: false,
+                contiguous: true,
+                ssrc: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            feedback.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(MediaFeedback::VideoFrameAccepted {
+                frame_index: Some(2),
+                ..
+            })
+        ));
+        shared.video.close();
+        worker.join().unwrap();
+        assert!(!shared.video_desynced.load(Ordering::Acquire));
+        assert!(!shared.keyframe_requested.load(Ordering::Acquire));
+        assert!(shared.output.take_video().is_some());
         assert!(feedback.try_recv().is_err());
     }
 
@@ -4695,6 +5456,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::Paused
         );
@@ -4709,6 +5471,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::Closed
         );
@@ -4746,6 +5509,7 @@ mod tests {
                 clock_rate_hz: 90_000,
                 keyframe: false,
                 contiguous: true,
+                ssrc: None,
             }),
             PushOutcome::DroppedOldest
         );
