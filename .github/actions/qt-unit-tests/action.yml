@@ -160,7 +160,11 @@ runs:
         if [[ "$RUNNER_OS" == Windows ]]; then
           args+=(-DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl)
         elif [[ "$RUNNER_OS" == macOS ]]; then
-          args+=("-DCMAKE_OSX_ARCHITECTURES=$TARGET_ARCH" "-DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET")
+          target_arch="$TARGET_ARCH"
+          if [[ "$target_arch" == "x64" ]]; then
+            target_arch="x86_64"
+          fi
+          args+=("-DCMAKE_OSX_ARCHITECTURES=$target_arch" "-DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET")
         fi
         cmake -S opennow-qt -B build/opennow-qt-checks -G Ninja \
           -DCMAKE_BUILD_TYPE=Debug \

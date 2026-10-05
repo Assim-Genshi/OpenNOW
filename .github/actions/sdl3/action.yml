@@ -48,7 +48,11 @@ runs:
             args+=(-DCMAKE_SYSTEM_NAME=Windows -DCMAKE_SYSTEM_PROCESSOR=ARM64)
           fi
         elif [[ "$RUNNER_OS" == macOS ]]; then
-          args+=("-DCMAKE_OSX_ARCHITECTURES=$SDL_TARGET_ARCH" "-DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET" -DSDL_FRAMEWORK=OFF)
+          sdl_arch="$SDL_TARGET_ARCH"
+          if [[ "$sdl_arch" == "x64" ]]; then
+            sdl_arch="x86_64"
+          fi
+          args+=("-DCMAKE_OSX_ARCHITECTURES=$sdl_arch" "-DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET" -DSDL_FRAMEWORK=OFF)
         fi
         git clone --depth 1 --branch "$SDL_VERSION" https://github.com/libsdl-org/SDL.git "$RUNNER_TEMP/SDL"
         cmake -S "$RUNNER_TEMP/SDL" -B "$RUNNER_TEMP/SDL-build" \

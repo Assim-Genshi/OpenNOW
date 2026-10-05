@@ -1,0 +1,235 @@
+name: Qt macOS Intel (x64) build
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Unsigned build channel (nightly, supporter, or stable)
+        type: string
+        default: nightly
+      runner:
+        description: GitHub Actions runner image
+        type: string
+        default: blacksmith-6vcpu-macos-15
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Package macOS Intel (x64)
+    runs-on: ${{ inputs.runner || 'blacksmith-6vcpu-macos-15' }}
+    timeout-minutes: 60
+
+    env:
+      CARGO_TERM_COLOR: always
+      SDL_VERSION: release-3.2.20
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Record immutable build identity
+        id: version
+        shell: bash
+        env:
+          BUILD_CHANNEL: ${{ inputs.channel }}
+        run: |
+          version=$(python3 opennow-qt/packaging/nightly_release.py version \
+            --run "$GITHUB_RUN_NUMBER" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --channel "$BUILD_CHANNEL")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "OPENNOW_BUILD_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Add Rust Intel macOS target
+        shell: bash
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: mac
+          target: desktop
+          arch: clang_64
+          modules: qtmultimedia qtshadertools
+          cache: true
+          cache-key-prefix: qt-target-macos-x64
+
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: qt-ci-macos-x64
+          cache-bin: false
+          cache-on-failure: true
+          workspaces: |
+            native/opennow-core -> target
+            native/opennow-streamer -> target
+            native/opennow-core -> ../../build/opennow-qt-release/rust-target
+            native/opennow-core -> ../../build/opennow-qt-release/update-helper-rust-target
+            native/opennow-streamer -> ../../build/opennow-qt-release/streamer-rust-target
+
+      - name: Cache Qt C++ compilation
+        uses: hendrikmuhs/ccache-action@5ebbd400eff9e74630f759d94ddd7b6c26299639
+        with:
+          key: qt-ci-macos-x64
+          restore-keys: qt-ci-macos-x64
+          max-size: 1G
+          verbose: 1
+
+      - name: Build and cache SDL3
+        uses: ./.github/actions/sdl3
+        with:
+          version: ${{ env.SDL_VERSION }}
+          target-arch: x64
+          parallel: 3
+
+      - name: Configure and build Qt native release
+        shell: bash
+        run: |
+          cmake -S opennow-qt -B build/opennow-qt-release \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
+            -DOPENNOW_MACOS_ADHOC_SIGN=ON \
+            -DOPENNOW_BUILD_VERSION="$OPENNOW_BUILD_VERSION" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/SDL-install"
+          cmake --build build/opennow-qt-release --parallel 3
+
+      - name: Test Qt shell and embedded runtime offscreen
+        shell: bash
+        run: |
+          ctest --test-dir build/opennow-qt-release --output-on-failure --parallel 2 --no-tests=error -LE interactive-desktop \
+            -R '^opennow-.*-tests$|^opennow-acceptance-verifier-help$|^qml-(desktop-route-(home|settings|stream)|fullscreen-.*stats-shortcut|desktop-stream-.*|streamer-event-contract)$'
+
+      - name: Package unsigned macOS DMG and validation ZIP
+        shell: bash
+        run: |
+          mkdir -p build/qt-packages
+          cpack --config build/opennow-qt-release/CPackConfig.cmake \
+            -G 'DragNDrop;ZIP' -B build/qt-packages
+
+      - name: Test relocated bundle without development libraries
+        shell: bash
+        run: |
+          packages=(build/qt-packages/OpenNOW-Qt-*-Darwin-x64.zip)
+          [[ ${#packages[@]} -eq 1 && -f "${packages[0]}" ]]
+          ditto -x -k "${packages[0]}" "$RUNNER_TEMP/zip-relocated"
+          zip_app=$(find "$RUNNER_TEMP/zip-relocated" -name OpenNOW.app -type d -print -quit)
+          [[ -n "$zip_app" ]]
+          dmgs=(build/qt-packages/OpenNOW-Qt-*-Darwin-x64.dmg)
+          [[ ${#dmgs[@]} -eq 1 && -f "${dmgs[0]}" ]]
+          hdiutil verify "${dmgs[0]}"
+          mount="$RUNNER_TEMP/opennow-dmg"
+          mkdir -p "$mount" "$RUNNER_TEMP/dmg-relocated"
+          hdiutil attach "${dmgs[0]}" -readonly -nobrowse -mountpoint "$mount"
+          trap 'hdiutil detach "$mount"' EXIT
+          test -d "$mount/OpenNOW.app"
+          ditto "$mount/OpenNOW.app" "$RUNNER_TEMP/dmg-relocated/OpenNOW.app"
+          hdiutil detach "$mount"
+          trap - EXIT
+          for app in "$zip_app" "$RUNNER_TEMP/dmg-relocated/OpenNOW.app"; do
+            /usr/bin/codesign --verify --deep --strict "$app"
+            [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist") == io.github.opencloudgaming.OpenNOW ]]
+            identity=$(/usr/bin/codesign --display --verbose=4 "$app" 2>&1)
+            printf '%s\n' "$identity" | grep -Fx 'Identifier=io.github.opencloudgaming.OpenNOW'
+            printf '%s\n' "$identity" | grep -Fx 'Signature=adhoc'
+            printf '%s\n' "$identity" | grep -Fx 'TeamIdentifier=not set'
+            bin="$app/Contents/MacOS"
+            for executable in OpenNOW opennow-core opennow-acceptance-verify opennow-update-helper opennow-streamer; do
+              test -x "$bin/$executable"
+              lipo "$bin/$executable" -verify_arch x86_64
+            done
+            test -f "$bin/libopennow_streamer_ffi.dylib"
+            lipo "$bin/libopennow_streamer_ffi.dylib" -verify_arch x86_64
+            otool -D "$bin/libopennow_streamer_ffi.dylib" \
+              | grep -Fx '@rpath/libopennow_streamer_ffi.dylib'
+            test -f "$app/Contents/Resources/licenses/THIRD_PARTY_NOTICES"
+            test -f "$app/Contents/PlugIns/imageformats/libqsvg.dylib"
+            restore() {
+              for path in "$PWD/build/opennow-qt-release" "$QT_ROOT_DIR" "$RUNNER_TEMP/SDL-install"; do
+                if [[ -d "$path.unavailable" ]]; then mv "$path.unavailable" "$path"; fi
+              done
+            }
+            trap restore EXIT
+            mv build/opennow-qt-release build/opennow-qt-release.unavailable
+            mv "$QT_ROOT_DIR" "$QT_ROOT_DIR.unavailable"
+            mv "$RUNNER_TEMP/SDL-install" "$RUNNER_TEMP/SDL-install.unavailable"
+            unset QT_PLUGIN_PATH QT_QPA_PLATFORM_PLUGIN_PATH QML2_IMPORT_PATH QML_IMPORT_PATH
+            unset DYLD_LIBRARY_PATH DYLD_FRAMEWORK_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_FALLBACK_FRAMEWORK_PATH
+            "$bin/opennow-acceptance-verify" --help
+            python3 - "$bin" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import select
+          import subprocess
+          import sys
+          import tempfile
+
+          bin_dir = Path(sys.argv[1])
+          for name in ("OpenNOW", "opennow-core", "opennow-acceptance-verify",
+                       "opennow-update-helper", "opennow-streamer", "libopennow_streamer_ffi.dylib"):
+              dependencies = subprocess.check_output(["otool", "-L", bin_dir / name], text=True)
+              for line in dependencies.splitlines()[1:]:
+                  dependency = line.strip().split(" (", 1)[0]
+                  assert not dependency.startswith("/") or dependency.startswith(
+                      ("/System/Library/", "/usr/lib/")), (name, dependency)
+          probe = subprocess.run(
+              [bin_dir / "opennow-streamer"],
+              input='{"id":"package-probe","type":"hello","protocolVersion":7}\n'
+                    '{"id":"package-shutdown","type":"shutdown"}\n',
+              text=True, capture_output=True, check=True, timeout=30)
+          messages = [json.loads(line) for line in probe.stdout.splitlines()]
+          ready = next(m for m in messages if m.get("id") == "package-probe")
+          assert ready.get("type") == "ready", ready
+          assert any(b.get("backend") == "videotoolbox" for b in ready["capabilities"]["videoBackends"])
+          with tempfile.TemporaryDirectory() as data_dir:
+              core = subprocess.Popen(
+                  [bin_dir / "opennow-core", "--data-dir", data_dir],
+                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+              try:
+                  core.stdin.write('{"type":"request","id":"package-core","method":"core.hello",'
+                                   '"params":{"protocolVersion":5}}\n')
+                  core.stdin.flush()
+                  assert select.select([core.stdout], [], [], 30)[0], "Core handshake timed out"
+                  response = json.loads(core.stdout.readline())
+                  assert response.get("id") == "package-core" and response.get("ok") is True, response
+                  assert {"catalog.libraryPages.v1", "catalog.metadata.v1", "account.syncObservation.v1", "catalog.languages.v1", "queue.servers.v1"}.issubset(response["result"]["capabilities"]), response
+              finally:
+                  core.kill()
+                  core.communicate(timeout=5)
+          subprocess.run(
+              [bin_dir / "OpenNOW", "--smoke-test", "--allow-multiple-instances",
+               "--desktop", "--route", "home", "--reduced-motion"],
+              env={**os.environ, "QT_QPA_PLATFORM": "cocoa"}, check=True, timeout=30)
+          PY
+            restore
+            trap - EXIT
+          done
+
+      - name: Upload macOS Intel validation package
+        uses: actions/upload-artifact@v4
+        with:
+          name: opennow-macos-x64-validation
+          path: build/qt-packages/*.zip
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload unsigned macOS Intel DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: opennow-qt-macos-x64-unsigned
+          path: build/qt-packages/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
