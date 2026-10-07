@@ -7,10 +7,15 @@ on:
         description: Unsigned build channel (nightly, supporter, or stable)
         type: string
         default: nightly
-      runner:
-        description: GitHub Actions runner image
-        type: string
-        default: blacksmith-6vcpu-macos-15
+      macos_runner:
+        description: GitHub Actions runner image (use macos-15 or macos-14 for standard GitHub runners)
+        type: choice
+        options:
+          - macos-15
+          - macos-14
+          - macos-latest
+          - blacksmith-6vcpu-macos-15
+        default: macos-15
 
 permissions:
   contents: read
@@ -18,7 +23,7 @@ permissions:
 jobs:
   build:
     name: Package macOS Intel (x64)
-    runs-on: ${{ inputs.runner || 'blacksmith-6vcpu-macos-15' }}
+    runs-on: ${{ inputs.macos_runner || 'macos-15' }}
     timeout-minutes: 60
 
     env:
