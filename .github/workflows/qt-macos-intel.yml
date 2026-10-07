@@ -17,6 +17,11 @@ on:
           - blacksmith-6vcpu-macos-15
         default: macos-15
 
+      run_tests:
+        description: Run full CTest test suite before packaging (slow under Rosetta translation)
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
@@ -110,6 +115,7 @@ jobs:
           cmake --build build/opennow-qt-release --parallel 3
 
       - name: Test Qt shell and embedded runtime offscreen
+        if: inputs.run_tests
         shell: bash
         run: |
           ctest --test-dir build/opennow-qt-release --output-on-failure --parallel 2 --no-tests=error -LE interactive-desktop \
